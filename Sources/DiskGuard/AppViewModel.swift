@@ -71,9 +71,15 @@ public final class AppViewModel: ObservableObject {
         }
     }
 
+    public let sizeCache = DirectorySizeCache()
+
     private let preferences: UserPreferences
     private var isInitializing = true
     private var scanTask: Task<Void, Never>?
+    private var refreshTask: Task<Void, Never>?
+    private var scanGeneration: UInt64 = 0
+    private var streamedByID: [String: ScanItem] = [:]
+    private var lastStreamPublish: ContinuousClock.Instant?
 
     public init(preferences: UserPreferences = UserPreferences()) {
         self.preferences = preferences
@@ -140,17 +146,35 @@ public final class AppViewModel: ObservableObject {
 
     public func startScan() {
         scanTask?.cancel()
+        refreshTask?.cancel()
+        scanGeneration &+= 1
+        let generation = scanGeneration
+
+        sizeCache.clear()
+        streamedByID.removeAll()
+        lastStreamPublish = nil
         isScanning = true
         scanProgressText = "正在启动扫描..."
 
+        let cache = sizeCache
         scanTask = Task {
             let scanner = DiskScanner()
-            let result = await scanner.scanAll { [weak self] progress in
-                Task { @MainActor in
-                    self?.scanProgressText = progress
+            let result = await scanner.scanAll(
+                sizeCache: cache,
+                onProgress: { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.scanGeneration == generation, self.isScanning else { return }
+                        self.scanProgressText = progress
+                    }
+                },
+                onBatch: { [weak self] batch in
+                    Task { @MainActor [weak self] in
+                        self?.mergeStreamedBatch(batch, generation: generation)
+                    }
                 }
-            }
+            )
             if Task.isCancelled { return }
+            guard self.scanGeneration == generation else { return }
 
             self.volumeStats = result.volumeStats
             self.fdaStatus = result.fdaStatus
@@ -166,6 +190,20 @@ public final class AppViewModel: ObservableObject {
                 level: .info,
                 message: String(format: "扫描完成（%.1f 秒），共发现 %d 个项目。", result.durationSeconds, result.items.count)
             )
+        }
+    }
+
+    private func mergeStreamedBatch(_ batch: [ScanItem], generation: UInt64) {
+        guard scanGeneration == generation, isScanning, !batch.isEmpty else { return }
+        let wasEmpty = streamedByID.isEmpty
+        for item in batch {
+            streamedByID[item.id] = item
+        }
+        let now = ContinuousClock.now
+        let shouldPublish = wasEmpty || lastStreamPublish.map { now - $0 >= .milliseconds(100) } ?? true
+        if shouldPublish {
+            lastStreamPublish = now
+            self.items = DiskScanner.deduplicateAndSort(Array(streamedByID.values))
         }
     }
 
@@ -233,6 +271,7 @@ public final class AppViewModel: ObservableObject {
 
         appendLog(level: .info, message: "开始安全清理（共 \(targets.count) 项，全部仅移入废纸篓）...")
 
+        let cache = sizeCache
         Task {
             let safety = SafetyGuard()
             let total = targets.count
@@ -242,7 +281,12 @@ public final class AppViewModel: ObservableObject {
 
             for (index, item) in targets.enumerated() {
                 let report = await Task.detached(priority: .userInitiated) {
-                    safety.trash(item: item)
+                    safety.trash(
+                        item: item,
+                        sizeEstimator: { url in
+                            cache.size(for: url) ?? SafetyGuard.defaultSizeBytes(at: url)
+                        }
+                    )
                 }.value
 
                 totalReclaimed += report.reclaimedBytes
@@ -259,12 +303,13 @@ public final class AppViewModel: ObservableObject {
             }
 
             self.isCleaning = false
-            self.volumeStats = DiskScanner.readVolumeStats()
             self.appendLog(
                 level: .success,
                 message: "清理完成：共将 \(totalTrashed) 项安全移入废纸篓（合计 \(DiskByteFormatter.string(from: totalReclaimed))，跳过 \(totalSkipped) 项）。请在访达「清倒废纸篓」后正式释放空间。"
             )
-            self.startScan()
+
+            let affectedURLs = targets.flatMap(\.targets)
+            await self.performIncrementalRefresh(affectedPaths: affectedURLs, includeTrash: true)
         }
     }
 
@@ -324,9 +369,30 @@ public final class AppViewModel: ObservableObject {
         isLogDrawerExpanded = true
     }
 
-    public func refreshAfterBrowserMutation() {
-        volumeStats = DiskScanner.readVolumeStats()
-        startScan()
+    public func refreshAfterBrowserMutation(affectedPaths: [URL] = [], includeTrash: Bool = true) {
+        refreshTask?.cancel()
+        refreshTask = Task {
+            await performIncrementalRefresh(affectedPaths: affectedPaths, includeTrash: includeTrash)
+        }
+    }
+
+    private func performIncrementalRefresh(affectedPaths: [URL], includeTrash: Bool) async {
+        guard !isScanning else { return }
+        let scanner = DiskScanner()
+        let refreshed = await scanner.refreshTargets(
+            existingItems: items,
+            affectedPaths: affectedPaths,
+            includeTrash: includeTrash,
+            fdaStatus: fdaStatus,
+            sizeCache: sizeCache
+        )
+        if Task.isCancelled || isScanning { return }
+
+        self.volumeStats = refreshed.volumeStats
+        self.items = refreshed.items
+        let validSelectableIDs = Set(refreshed.items.filter(\.isSelectable).map(\.id))
+        self.selectedIDs = self.selectedIDs.intersection(validSelectableIDs)
+        self.scanProgressText = "已增量更新（共 \(refreshed.items.count) 项）"
     }
 
     public func openTrashInFinder() {

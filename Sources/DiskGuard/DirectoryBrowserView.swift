@@ -102,7 +102,12 @@ final class DirectoryBrowserViewModel: ObservableObject {
         return stack[index].lastPathComponent
     }
 
-    func loadCurrentDirectory() {
+    func cancelPendingTasks() {
+        sizeTask?.cancel()
+        sizeTask = nil
+    }
+
+    func loadCurrentDirectory(forceRefresh: Bool = false) {
         sizeTask?.cancel()
         isLoadingList = true
         isSizing = false
@@ -111,69 +116,114 @@ final class DirectoryBrowserViewModel: ObservableObject {
         selectedIDs.removeAll()
 
         let url = currentURL
-        do {
-            let listed = try DiskScanner.listImmediateEntries(at: url)
-            self.entries = listed
-            self.isLoadingList = false
-            startAsyncDirectorySizing(for: listed)
-        } catch let nsError as NSError {
-            self.entries = []
-            self.isLoadingList = false
-            if nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileReadNoPermissionError {
-                self.needsFDA = true
-                self.errorMessage = "系统隐私权限拦截了此目录读取，需要授予「完全磁盘访问权限」"
-            } else if nsError.domain == NSPOSIXErrorDomain && (nsError.code == Int(EPERM) || nsError.code == Int(EACCES)) {
-                self.needsFDA = true
-                self.errorMessage = "系统隐私权限拦截了此目录读取，需要授予「完全磁盘访问权限」"
-            } else {
-                self.errorMessage = "无法读取目录：\(nsError.localizedDescription)"
+        let cache = mainViewModel?.sizeCache
+        if forceRefresh {
+            cache?.invalidate(prefixPath: url.standardizedFileURL.path)
+        }
+
+        sizeTask = Task {
+            do {
+                let listed = try await DiskScanner.runOnIOQueue {
+                    Result { try DiskScanner.listImmediateEntries(at: url) }
+                }.get()
+                if Task.isCancelled { return }
+
+                var populated = listed
+                if let cache {
+                    for idx in populated.indices where populated[idx].isDirectory && !populated[idx].isSymbolicLink {
+                        if let cached = cache.size(for: populated[idx].url) {
+                            populated[idx].sizeBytes = cached
+                        }
+                    }
+                    populated.sort { lhs, rhs in
+                        if lhs.isDirectory != rhs.isDirectory {
+                            return lhs.isDirectory && !rhs.isDirectory
+                        }
+                        let ls = lhs.sizeBytes ?? 0
+                        let rs = rhs.sizeBytes ?? 0
+                        if ls != rs { return ls > rs }
+                        return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                    }
+                }
+
+                self.entries = populated
+                self.isLoadingList = false
+                await runAsyncDirectorySizing(for: populated, cache: cache)
+            } catch let nsError as NSError {
+                if Task.isCancelled { return }
+                self.entries = []
+                self.isLoadingList = false
+                if nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileReadNoPermissionError {
+                    self.needsFDA = true
+                    self.errorMessage = "系统隐私权限拦截了此目录读取，需要授予「完全磁盘访问权限」"
+                } else if nsError.domain == NSPOSIXErrorDomain && (nsError.code == Int(EPERM) || nsError.code == Int(EACCES)) {
+                    self.needsFDA = true
+                    self.errorMessage = "系统隐私权限拦截了此目录读取，需要授予「完全磁盘访问权限」"
+                } else {
+                    self.errorMessage = "无法读取目录：\(nsError.localizedDescription)"
+                }
             }
         }
     }
 
-    private func startAsyncDirectorySizing(for listed: [DirectoryEntry]) {
-        let dirTargets = listed.filter { $0.isDirectory && !$0.isSymbolicLink }
-        guard !dirTargets.isEmpty else { return }
+    private func runAsyncDirectorySizing(for listed: [DirectoryEntry], cache: DirectorySizeCache?) async {
+        let dirTargets = listed.filter { $0.isDirectory && !$0.isSymbolicLink && $0.sizeBytes == nil }
+        guard !dirTargets.isEmpty else {
+            isSizing = false
+            return
+        }
 
         isSizing = true
-        sizeTask = Task {
-            let maxConcurrency = 6
+        let cancelFlag = AtomicCancelFlag()
+        let maxConcurrency = min(10, max(6, ProcessInfo.processInfo.activeProcessorCount))
+
+        await withTaskCancellationHandler {
             await withTaskGroup(of: (String, Int64).self) { group in
                 var iterator = dirTargets.makeIterator()
                 for _ in 0..<min(maxConcurrency, dirTargets.count) {
                     if let next = iterator.next() {
                         group.addTask {
                             if Task.isCancelled { return (next.id, 0) }
-                            let sz = DiskScanner.directorySize(at: next.url)
+                            let sz = await DiskScanner.runOnIOQueue {
+                                DiskScanner.directorySize(at: next.url, cache: cache, cacheDepth: 3, cancelFlag: cancelFlag)
+                            }
                             return (next.id, sz)
                         }
                     }
                 }
 
                 while let (entryID, size) = await group.next() {
-                    if Task.isCancelled { return }
+                    if Task.isCancelled {
+                        cancelFlag.cancel()
+                        group.cancelAll()
+                        return
+                    }
                     if let idx = self.entries.firstIndex(where: { $0.id == entryID }) {
                         self.entries[idx].sizeBytes = size
                     }
                     if let next = iterator.next() {
                         group.addTask {
                             if Task.isCancelled { return (next.id, 0) }
-                            let sz = DiskScanner.directorySize(at: next.url)
+                            let sz = await DiskScanner.runOnIOQueue {
+                                DiskScanner.directorySize(at: next.url, cache: cache, cacheDepth: 3, cancelFlag: cancelFlag)
+                            }
                             return (next.id, sz)
                         }
                     }
                 }
             }
-
-            if Task.isCancelled { return }
-            self.entries.sort { lhs, rhs in
-                let ls = lhs.sizeBytes ?? -1
-                let rs = rhs.sizeBytes ?? -1
-                if ls != rs { return ls > rs }
-                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-            }
-            self.isSizing = false
+        } onCancel: {
+            cancelFlag.cancel()
         }
+
+        if Task.isCancelled { return }
+        self.entries.sort { lhs, rhs in
+            let ls = lhs.sizeBytes ?? -1
+            let rs = rhs.sizeBytes ?? -1
+            if ls != rs { return ls > rs }
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
+        self.isSizing = false
     }
 
     func openFolder(_ entry: DirectoryEntry) {
@@ -236,23 +286,33 @@ final class DirectoryBrowserViewModel: ObservableObject {
         pendingAction = nil
         isOperating = true
 
+        let cache = mainViewModel?.sizeCache
         Task {
             let safety = SafetyGuard()
             let report: CleanItemReport
+            let affectedPaths: [URL]
 
             switch action {
             case .deleteSelected(let items):
                 let urls = items.map(\.url)
+                affectedPaths = urls
                 report = await Task.detached(priority: .userInitiated) {
-                    safety.permanentlyDeleteFromTrash(targets: urls)
+                    safety.permanentlyDeleteFromTrash(
+                        targets: urls,
+                        sizeEstimator: { url in cache?.size(for: url) ?? SafetyGuard.defaultSizeBytes(at: url) }
+                    )
                 }.value
 
             case .emptyTrash:
+                affectedPaths = [context.rootURL()]
                 report = await Task.detached(priority: .userInitiated) {
-                    safety.emptyTrash()
+                    safety.emptyTrash(
+                        sizeEstimator: { url in cache?.size(for: url) ?? SafetyGuard.defaultSizeBytes(at: url) }
+                    )
                 }.value
 
             case .moveChildToTrash(let entry):
+                affectedPaths = [entry.url]
                 let scanItem = ScanItem(
                     id: "browser.child.\(entry.id)",
                     title: entry.name,
@@ -265,14 +325,22 @@ final class DirectoryBrowserViewModel: ObservableObject {
                     sizeBytes: entry.sizeBytes ?? 0
                 )
                 report = await Task.detached(priority: .userInitiated) {
-                    safety.trash(item: scanItem)
+                    safety.trash(
+                        item: scanItem,
+                        sizeEstimator: { url in cache?.size(for: url) ?? SafetyGuard.defaultSizeBytes(at: url) }
+                    )
                 }.value
             }
+
+            for path in affectedPaths {
+                cache?.invalidate(prefixPath: path.standardizedFileURL.path)
+            }
+            cache?.invalidate(prefixPath: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".Trash").standardizedFileURL.path)
 
             self.isOperating = false
             self.mainViewModel?.appendLogs(report.messages)
             self.loadCurrentDirectory()
-            self.mainViewModel?.refreshAfterBrowserMutation()
+            self.mainViewModel?.refreshAfterBrowserMutation(affectedPaths: affectedPaths, includeTrash: true)
         }
     }
 
@@ -329,6 +397,9 @@ struct DirectoryBrowserView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             viewModel.loadCurrentDirectory()
+        }
+        .onDisappear {
+            viewModel.cancelPendingTasks()
         }
         .alert(
             viewModel.pendingAction?.title ?? "",
@@ -404,7 +475,7 @@ struct DirectoryBrowserView: View {
             Spacer()
 
             Button {
-                viewModel.loadCurrentDirectory()
+                viewModel.loadCurrentDirectory(forceRefresh: true)
             } label: {
                 Label("刷新", systemImage: "arrow.clockwise")
             }

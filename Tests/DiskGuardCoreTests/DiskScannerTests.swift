@@ -149,4 +149,250 @@ struct DiskScannerTests {
         #expect(reader.activeFilterRawValue == "safe")
         #expect(reader.isLogDrawerExpanded == true)
     }
+
+    private static func referenceEnumeratorSize(at url: URL) -> Int64 {
+        let fm = FileManager.default
+        let keys: [URLResourceKey] = [
+            .isRegularFileKey,
+            .isSymbolicLinkKey,
+            .totalFileAllocatedSizeKey,
+            .fileAllocatedSizeKey,
+            .fileResourceIdentifierKey
+        ]
+        guard let enumerator = fm.enumerator(at: url, includingPropertiesForKeys: keys, options: []) else {
+            return 0
+        }
+        var seenInodes = Set<Data>()
+        var total: Int64 = 0
+        for case let itemURL as URL in enumerator {
+            guard let vals = try? itemURL.resourceValues(forKeys: Set(keys)) else { continue }
+            if vals.isSymbolicLink == true {
+                continue
+            }
+            guard vals.isRegularFile == true else { continue }
+            if let identifier = vals.fileResourceIdentifier as? Data {
+                if !seenInodes.insert(identifier).inserted { continue }
+            }
+            total += Int64(vals.totalFileAllocatedSize ?? vals.fileAllocatedSize ?? 0)
+        }
+        return total
+    }
+
+    @Test("FastDirectorySizer matches reference FileManager enumerator on mixed tree with hardlinks and symlinks")
+    func fastDirectorySizerMatchesReferenceEnumerator() throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let subA = root.appendingPathComponent("a/b/c")
+        let subB = root.appendingPathComponent("sibling")
+        let emptyDir = root.appendingPathComponent("empty")
+        let outsideTarget = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: outsideTarget) }
+
+        try FileManager.default.createDirectory(at: subA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: subB, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: emptyDir, withIntermediateDirectories: true)
+
+        let f1 = subA.appendingPathComponent("one.bin")
+        let f2 = root.appendingPathComponent(".dotfile")
+        let f3 = subB.appendingPathComponent("three.bin")
+        try Data(repeating: 0x11, count: 16_384).write(to: f1)
+        try Data(repeating: 0x22, count: 32_768).write(to: f2)
+        try Data(repeating: 0x33, count: 24_576).write(to: f3)
+
+        // Hardlink in same directory and across sibling directory
+        try FileManager.default.linkItem(at: f1, to: subA.appendingPathComponent("one-hardlink.bin"))
+        try FileManager.default.linkItem(at: f1, to: subB.appendingPathComponent("one-crosslink.bin"))
+
+        // Symlink to outside file & outside directory (must NOT be followed)
+        let outsideBig = outsideTarget.appendingPathComponent("big.bin")
+        try Data(repeating: 0x99, count: 262_144).write(to: outsideBig)
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("link-to-file"), withDestinationURL: outsideBig)
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("link-to-dir"), withDestinationURL: outsideTarget)
+
+        let fastSize = FastDirectorySizer.directorySize(at: root)
+        let refSize = Self.referenceEnumeratorSize(at: root)
+
+        #expect(fastSize == refSize)
+        #expect(fastSize == 73_728)
+        #expect(fastSize < 262_144)
+        #expect(FastDirectorySizer.directorySize(at: root.appendingPathComponent("link-to-dir")) == 0)
+        #expect(FastDirectorySizer.directorySize(at: f1) == FastDirectorySizer.directorySize(at: f1))
+    }
+
+    @Test("DirectorySizeCache records up to cacheDepth and invalidates targets, descendants, and ancestors")
+    func directorySizeCacheDepthAndInvalidation() throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let d1 = root.appendingPathComponent("sub1")
+        let d2 = d1.appendingPathComponent("sub2")
+        let d3 = d2.appendingPathComponent("sub3")
+        let sibling = root.appendingPathComponent("other")
+        try FileManager.default.createDirectory(at: d3, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sibling, withIntermediateDirectories: true)
+
+        try Data(repeating: 0xAA, count: 8_192).write(to: d3.appendingPathComponent("deep.bin"))
+        try Data(repeating: 0xBB, count: 8_192).write(to: sibling.appendingPathComponent("side.bin"))
+
+        let cache = DirectorySizeCache()
+        let total = FastDirectorySizer.directorySize(at: root, cache: cache, cacheDepth: 2)
+
+        #expect(total > 0)
+        #expect(cache.size(for: root) == total)
+        #expect(cache.size(for: d1) != nil)
+        #expect(cache.size(for: d2) != nil)
+        #expect(cache.size(for: d3) == nil)
+        #expect(cache.size(for: sibling) != nil)
+
+        cache.invalidate(prefixPath: d2.path)
+
+        #expect(cache.size(for: d2) == nil)
+        #expect(cache.size(for: d1) == nil)
+        #expect(cache.size(for: root) == nil)
+        #expect(cache.size(for: sibling) != nil)
+    }
+
+    @Test("AtomicCancelFlag aborts FastDirectorySizer without populating cache")
+    func atomicCancelFlagAbortsWithoutCaching() throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try Data(repeating: 0x44, count: 16_384).write(to: root.appendingPathComponent("data.bin"))
+        let flag = AtomicCancelFlag()
+        flag.cancel()
+
+        let cache = DirectorySizeCache()
+        let size = FastDirectorySizer.directorySize(at: root, cache: cache, cacheDepth: 3, cancelFlag: flag)
+
+        #expect(size == 0)
+        #expect(cache.size(for: root) == nil)
+    }
+
+    private final class BatchCollector: @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var batches: [[ScanItem]] = []
+
+        func append(_ items: [ScanItem]) {
+            lock.lock()
+            batches.append(items)
+            lock.unlock()
+        }
+    }
+
+    @Test("DiskScanner.scanAll streams batches in phases and deduplicates sorted items")
+    func scanAllStreamsBatchesAndDeduplicates() async throws {
+        let sandbox = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let home = sandbox.appendingPathComponent("home")
+        let apps = sandbox.appendingPathComponent("Apps")
+        let sysLib = sandbox.appendingPathComponent("SysLib")
+        let conda = sandbox.appendingPathComponent("conda")
+
+        let homebrew = home.appendingPathComponent("Library/Caches/Homebrew")
+        let npmCache = home.appendingPathComponent(".npm/_cacache")
+        let trash = home.appendingPathComponent(".Trash")
+        let downloads = home.appendingPathComponent("Downloads")
+        let appSupport = home.appendingPathComponent("Library/Application Support")
+
+        for dir in [homebrew, npmCache, trash, downloads, appSupport, apps, sysLib, conda] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+
+        try Data(repeating: 0x01, count: 1_200_000).write(to: homebrew.appendingPathComponent("pkg.tar.gz"))
+        try Data(repeating: 0x02, count: 1_400_000).write(to: npmCache.appendingPathComponent("index.bin"))
+        try Data(repeating: 0x03, count: 1_100_000).write(to: trash.appendingPathComponent("old.bin"))
+
+        let scanner = DiskScanner(
+            homeDirectory: home,
+            applicationsDirectory: apps,
+            systemLibraryDirectory: sysLib,
+            minicondaPkgsDirectory: conda
+        )
+        let cache = DirectorySizeCache()
+        let collector = BatchCollector()
+
+        let result = await scanner.scanAll(
+            sizeCache: cache,
+            onProgress: { _ in },
+            onBatch: { batch in
+                collector.append(batch)
+            }
+        )
+
+        #expect(!collector.batches.isEmpty)
+        let ids = result.items.map(\.id)
+        #expect(Set(ids).count == ids.count)
+        #expect(ids.contains("tier1.cache.Homebrew"))
+        #expect(ids.contains("tier1.npm._cacache"))
+        #expect(ids.contains("tier3.trash"))
+
+        // Verify tier ordering: safe before readOnly
+        if let safeIdx = result.items.firstIndex(where: { $0.id == "tier1.cache.Homebrew" }),
+           let trashIdx = result.items.firstIndex(where: { $0.id == "tier3.trash" }) {
+            #expect(safeIdx < trashIdx)
+        }
+    }
+
+    @Test("DiskScanner.refreshTargets incrementally updates removed, shrunken, and trash items")
+    func refreshTargetsUpdatesIncrementally() async throws {
+        let sandbox = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let home = sandbox.appendingPathComponent("home")
+        let apps = sandbox.appendingPathComponent("Apps")
+        let sysLib = sandbox.appendingPathComponent("SysLib")
+        let conda = sandbox.appendingPathComponent("conda")
+
+        let homebrew = home.appendingPathComponent("Library/Caches/Homebrew")
+        let npmCache = home.appendingPathComponent(".npm/_cacache")
+        let trash = home.appendingPathComponent(".Trash")
+        let downloads = home.appendingPathComponent("Downloads")
+        let appSupport = home.appendingPathComponent("Library/Application Support")
+
+        for dir in [homebrew, npmCache, trash, downloads, appSupport, apps, sysLib, conda] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+
+        try Data(repeating: 0x01, count: 1_200_000).write(to: homebrew.appendingPathComponent("pkg.tar.gz"))
+        let npmA = npmCache.appendingPathComponent("a.bin")
+        let npmB = npmCache.appendingPathComponent("b.bin")
+        try Data(repeating: 0x02, count: 1_200_000).write(to: npmA)
+        try Data(repeating: 0x02, count: 1_200_000).write(to: npmB)
+        try Data(repeating: 0x03, count: 1_100_000).write(to: trash.appendingPathComponent("old.bin"))
+
+        let scanner = DiskScanner(
+            homeDirectory: home,
+            applicationsDirectory: apps,
+            systemLibraryDirectory: sysLib,
+            minicondaPkgsDirectory: conda
+        )
+        let cache = DirectorySizeCache()
+
+        let initial = await scanner.scanAll(sizeCache: cache, onProgress: { _ in })
+        let initialNpm = try #require(initial.items.first(where: { $0.id == "tier1.npm._cacache" }))
+        let initialTrash = try #require(initial.items.first(where: { $0.id == "tier3.trash" }))
+
+        // Mutate disk: delete Homebrew, delete one npm cache file, add a file to Trash
+        try FileManager.default.removeItem(at: homebrew)
+        try FileManager.default.removeItem(at: npmB)
+        try Data(repeating: 0x04, count: 1_300_000).write(to: trash.appendingPathComponent("more.bin"))
+
+        let refreshed = await scanner.refreshTargets(
+            existingItems: initial.items,
+            affectedPaths: [homebrew, npmCache],
+            includeTrash: true,
+            fdaStatus: .granted,
+            sizeCache: cache
+        )
+
+        #expect(refreshed.items.first(where: { $0.id == "tier1.cache.Homebrew" }) == nil)
+        let updatedNpm = try #require(refreshed.items.first(where: { $0.id == "tier1.npm._cacache" }))
+        let updatedTrash = try #require(refreshed.items.first(where: { $0.id == "tier3.trash" }))
+
+        #expect(updatedNpm.sizeBytes < initialNpm.sizeBytes)
+        #expect(updatedNpm.sizeBytes >= 1_000_000)
+        #expect(updatedTrash.sizeBytes > initialTrash.sizeBytes)
+    }
 }

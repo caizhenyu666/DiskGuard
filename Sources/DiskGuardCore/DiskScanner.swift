@@ -7,6 +7,12 @@ public final class DiskScanner: Sendable {
     public let systemLibraryDirectory: URL
     public let minicondaPkgsDirectory: URL
 
+    private static let ioQueue = DispatchQueue(
+        label: "com.local.diskguard.scanner.io",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
     public init(
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         applicationsDirectory: URL = URL(fileURLWithPath: "/Applications"),
@@ -17,6 +23,16 @@ public final class DiskScanner: Sendable {
         self.applicationsDirectory = applicationsDirectory.standardizedFileURL
         self.systemLibraryDirectory = systemLibraryDirectory.standardizedFileURL
         self.minicondaPkgsDirectory = minicondaPkgsDirectory.standardizedFileURL
+    }
+
+    public static func runOnIOQueue<T: Sendable>(
+        _ work: @escaping @Sendable () -> T
+    ) async -> T {
+        await withCheckedContinuation { continuation in
+            ioQueue.async {
+                continuation.resume(returning: work())
+            }
+        }
     }
 
     public static func readVolumeStats(at url: URL = URL(fileURLWithPath: "/")) -> VolumeStats {
@@ -61,48 +77,21 @@ public final class DiskScanner: Sendable {
     }
 
     public static func directorySize(at url: URL) -> Int64 {
-        let fm = FileManager.default
-        let vals = try? url.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey])
-        if vals?.isSymbolicLink == true {
-            return 0
-        }
-        if vals?.isDirectory == false {
-            return Int64(vals?.totalFileAllocatedSize ?? vals?.fileAllocatedSize ?? 0)
-        }
+        FastDirectorySizer.directorySize(at: url, cache: nil, cacheDepth: 0)
+    }
 
-        let keys: [URLResourceKey] = [
-            .isRegularFileKey,
-            .isSymbolicLinkKey,
-            .totalFileAllocatedSizeKey,
-            .fileAllocatedSizeKey,
-            .fileResourceIdentifierKey
-        ]
-        guard let enumerator = fm.enumerator(at: url, includingPropertiesForKeys: keys, options: []) else {
-            return 0
-        }
-
-        var seenInodes = Set<Data>()
-        var total: Int64 = 0
-
-        for case let itemURL as URL in enumerator {
-            guard let itemVals = try? itemURL.resourceValues(forKeys: Set(keys)) else {
-                continue
-            }
-            if itemVals.isSymbolicLink == true {
-                enumerator.skipDescendants()
-                continue
-            }
-            guard itemVals.isRegularFile == true else {
-                continue
-            }
-            if let identifier = itemVals.fileResourceIdentifier as? Data {
-                if !seenInodes.insert(identifier).inserted {
-                    continue
-                }
-            }
-            total += Int64(itemVals.totalFileAllocatedSize ?? itemVals.fileAllocatedSize ?? 0)
-        }
-        return total
+    public static func directorySize(
+        at url: URL,
+        cache: DirectorySizeCache?,
+        cacheDepth: Int = 3,
+        cancelFlag: AtomicCancelFlag? = nil
+    ) -> Int64 {
+        FastDirectorySizer.directorySize(
+            at: url,
+            cache: cache,
+            cacheDepth: cacheDepth,
+            cancelFlag: cancelFlag
+        )
     }
 
     public static func runningAppNames() -> Set<String> {
@@ -339,58 +328,266 @@ public final class DiskScanner: Sendable {
         return entries
     }
 
-    public func scanAll(onProgress: @escaping @Sendable (String) -> Void) async -> ScanResult {
+    public func scanAll(
+        sizeCache: DirectorySizeCache? = nil,
+        onProgress: @escaping @Sendable (String) -> Void,
+        onBatch: (@Sendable ([ScanItem]) -> Void)? = nil
+    ) async -> ScanResult {
         let start = Date()
         onProgress("正在读取磁盘容量与系统权限...")
 
-        let volumeStats = Self.readVolumeStats()
-        let fdaStatus = Self.checkFullDiskAccess(home: homeDirectory)
-        let runningApps = Self.runningAppNames()
-        let unityProjects = Self.discoverUnityProjects(in: homeDirectory)
+        let cancelFlag = AtomicCancelFlag()
 
-        let probes = RuleCatalog.buildProbes(
-            scanner: self,
-            fdaStatus: fdaStatus,
-            runningApps: runningApps,
-            unityProjects: unityProjects
-        )
+        return await withTaskCancellationHandler {
+            let (volumeStats, fdaStatus, runningApps, unityProjects) = await Self.runOnIOQueue {
+                (
+                    Self.readVolumeStats(),
+                    Self.checkFullDiskAccess(home: self.homeDirectory),
+                    Self.runningAppNames(),
+                    Self.discoverUnityProjects(in: self.homeDirectory)
+                )
+            }
 
-        var collected: [ScanItem] = []
-        let totalProbes = probes.count
-        var completed = 0
+            if Task.isCancelled {
+                cancelFlag.cancel()
+                return ScanResult(
+                    volumeStats: volumeStats,
+                    fdaStatus: fdaStatus,
+                    items: [],
+                    durationSeconds: Date().timeIntervalSince(start)
+                )
+            }
 
-        await withTaskGroup(of: (String, [ScanItem]).self) { group in
-            let maxConcurrency = 6
-            var iterator = probes.makeIterator()
+            let probes = await Self.runOnIOQueue {
+                RuleCatalog.buildProbes(
+                    scanner: self,
+                    fdaStatus: fdaStatus,
+                    runningApps: runningApps,
+                    unityProjects: unityProjects,
+                    sizeCache: sizeCache,
+                    cancelFlag: cancelFlag
+                )
+            }
 
-            for _ in 0..<min(maxConcurrency, totalProbes) {
-                if let probe = iterator.next() {
-                    group.addTask {
-                        if Task.isCancelled { return (probe.label, []) }
-                        return (probe.label, probe.run())
+            let phase0 = probes.filter { $0.phase == .fastCleanable }
+            let phase1 = probes.filter { $0.phase == .spaceInsights }
+            let totalProbes = probes.count
+            let maxConcurrency = min(12, max(6, ProcessInfo.processInfo.activeProcessorCount))
+
+            var collected: [ScanItem] = []
+            var completed = 0
+
+            for batchProbes in [phase0, phase1] where !batchProbes.isEmpty {
+                if Task.isCancelled {
+                    cancelFlag.cancel()
+                    break
+                }
+
+                await withTaskGroup(of: (String, [ScanItem]).self) { group in
+                    var iterator = batchProbes.makeIterator()
+
+                    for _ in 0..<min(maxConcurrency, batchProbes.count) {
+                        if let probe = iterator.next() {
+                            group.addTask {
+                                if Task.isCancelled { return (probe.label, []) }
+                                let result = await Self.runOnIOQueue {
+                                    probe.run()
+                                }
+                                return (probe.label, result)
+                            }
+                        }
+                    }
+
+                    while let (label, items) = await group.next() {
+                        if Task.isCancelled {
+                            cancelFlag.cancel()
+                            group.cancelAll()
+                            break
+                        }
+                        completed += 1
+                        onProgress("扫描中 (\(completed)/\(totalProbes))：\(label)")
+                        if !items.isEmpty {
+                            collected.append(contentsOf: items)
+                            onBatch?(items)
+                        }
+
+                        if let nextProbe = iterator.next() {
+                            group.addTask {
+                                if Task.isCancelled { return (nextProbe.label, []) }
+                                let result = await Self.runOnIOQueue {
+                                    nextProbe.run()
+                                }
+                                return (nextProbe.label, result)
+                            }
+                        }
                     }
                 }
             }
 
-            while let (label, items) = await group.next() {
-                if Task.isCancelled { break }
-                completed += 1
-                onProgress("扫描中 (\(completed)/\(totalProbes))：\(label)")
-                collected.append(contentsOf: items)
-
-                if let nextProbe = iterator.next() {
-                    group.addTask {
-                        if Task.isCancelled { return (nextProbe.label, []) }
-                        return (nextProbe.label, nextProbe.run())
-                    }
-                }
-            }
+            let uniqueItems = Self.deduplicateAndSort(collected)
+            let elapsed = Date().timeIntervalSince(start)
+            return ScanResult(
+                volumeStats: volumeStats,
+                fdaStatus: fdaStatus,
+                items: uniqueItems,
+                durationSeconds: elapsed
+            )
+        } onCancel: {
+            cancelFlag.cancel()
         }
+    }
 
-        // Deduplicate by id just in case, keeping highest priority entry
+    public func refreshTargets(
+        existingItems: [ScanItem],
+        affectedPaths: [URL],
+        includeTrash: Bool,
+        fdaStatus: FDAStatus,
+        sizeCache: DirectorySizeCache?
+    ) async -> (volumeStats: VolumeStats, items: [ScanItem]) {
+        await Self.runOnIOQueue {
+            let trashURL = self.homeDirectory.appendingPathComponent(".Trash").standardizedFileURL
+            let normalizedAffected = affectedPaths.map { Self.normalizePath($0.standardizedFileURL.path) }
+
+            for path in normalizedAffected {
+                sizeCache?.invalidate(prefixPath: path)
+            }
+            if includeTrash {
+                sizeCache?.invalidate(prefixPath: trashURL.path)
+            }
+
+            let fm = FileManager.default
+            var updated: [ScanItem] = []
+            updated.reserveCapacity(existingItems.count)
+
+            for item in existingItems {
+                if item.id == "tier3.trash" && includeTrash {
+                    continue
+                }
+
+                let overlaps = item.targets.contains { target in
+                    let tPath = Self.normalizePath(target.standardizedFileURL.path)
+                    return normalizedAffected.contains { aPath in
+                        tPath == aPath || tPath.hasPrefix(aPath + "/") || aPath.hasPrefix(tPath + "/")
+                    }
+                }
+
+                guard overlaps else {
+                    updated.append(item)
+                    continue
+                }
+
+                if item.id == "tier1.conda.archives" {
+                    let archives = Self.filterCondaArchives(in: self.minicondaPkgsDirectory)
+                    guard !archives.isEmpty else { continue }
+                    let total = archives.reduce(Int64(0)) { acc, url in
+                        let vals = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey])
+                        return acc + Int64(vals?.totalFileAllocatedSize ?? vals?.fileAllocatedSize ?? 0)
+                    }
+                    guard total >= RuleCatalog.minimumThresholdBytes else { continue }
+                    updated.append(ScanItem(
+                        id: item.id,
+                        title: "Conda 压缩包缓存 (\(archives.count) 个归档)",
+                        subtitle: item.subtitle,
+                        categoryIcon: item.categoryIcon,
+                        tier: item.tier,
+                        cleanupMode: item.cleanupMode,
+                        allowedRoot: item.allowedRoot,
+                        targets: archives,
+                        displayPathURL: item.displayPathURL,
+                        sizeBytes: total,
+                        lastModified: item.lastModified,
+                        lockReason: item.lockReason,
+                        runningAppWarning: item.runningAppWarning,
+                        guidance: item.guidance,
+                        isWorktreeException: item.isWorktreeException
+                    ))
+                    continue
+                }
+
+                let existingTargets = item.targets.filter { fm.fileExists(atPath: $0.path) }
+                guard !existingTargets.isEmpty else { continue }
+
+                let newSize = existingTargets.reduce(Int64(0)) { acc, target in
+                    acc + Self.directorySize(at: target, cache: sizeCache, cacheDepth: 3)
+                }
+
+                let threshold = Self.minimumSizeThreshold(for: item)
+                guard newSize >= threshold else { continue }
+
+                var updatedSubtitle = item.subtitle
+                if item.id.hasPrefix("tier3.home."), let dir = existingTargets.first {
+                    let name = dir.lastPathComponent
+                    let isBackup = name.localizedCaseInsensitiveContains("backup")
+                    var notes: [String] = []
+                    if isBackup { notes.append("疑似历史备份目录") }
+                    let gitDir = dir.appendingPathComponent(".git")
+                    if fm.fileExists(atPath: gitDir.path) {
+                        let gitSize = sizeCache?.size(for: gitDir) ?? Self.directorySize(at: gitDir, cache: sizeCache, cacheDepth: 2)
+                        notes.append(".git 占 \(DiskByteFormatter.string(from: gitSize))")
+                    }
+                    let assetsDir = dir.appendingPathComponent("Assets")
+                    let settingsDir = dir.appendingPathComponent("ProjectSettings")
+                    let unityLib = dir.appendingPathComponent("Library")
+                    if fm.fileExists(atPath: assetsDir.path),
+                       fm.fileExists(atPath: settingsDir.path),
+                       fm.fileExists(atPath: unityLib.path) {
+                        let libSize = sizeCache?.size(for: unityLib) ?? Self.directorySize(at: unityLib, cache: sizeCache, cacheDepth: 2)
+                        notes.append("Unity Library 占 \(DiskByteFormatter.string(from: libSize))")
+                    }
+                    updatedSubtitle = notes.isEmpty ? "主目录大文件夹（仅查看，保护你的代码与资料）" : notes.joined(separator: " · ")
+                }
+
+                let updatedDisplayURL = fm.fileExists(atPath: item.displayPathURL.path)
+                    ? item.displayPathURL
+                    : (existingTargets.first ?? item.allowedRoot)
+
+                updated.append(ScanItem(
+                    id: item.id,
+                    title: item.title,
+                    subtitle: updatedSubtitle,
+                    categoryIcon: item.categoryIcon,
+                    tier: item.tier,
+                    cleanupMode: item.cleanupMode,
+                    allowedRoot: item.allowedRoot,
+                    targets: existingTargets,
+                    displayPathURL: updatedDisplayURL,
+                    sizeBytes: newSize,
+                    lastModified: existingTargets.first.flatMap { Self.modificationDate(at: $0) } ?? item.lastModified,
+                    lockReason: item.lockReason,
+                    runningAppWarning: item.runningAppWarning,
+                    guidance: item.guidance,
+                    isWorktreeException: item.isWorktreeException
+                ))
+            }
+
+            if includeTrash, case .granted = fdaStatus, fm.fileExists(atPath: trashURL.path) {
+                let trashSize = Self.directorySize(at: trashURL, cache: sizeCache, cacheDepth: 3)
+                if trashSize >= RuleCatalog.minimumThresholdBytes {
+                    updated.append(ScanItem(
+                        id: "tier3.trash",
+                        title: "废纸篓当前占用",
+                        subtitle: "已删除但尚未清倒的文件仍占用磁盘空间",
+                        categoryIcon: "trash",
+                        tier: .readOnly,
+                        cleanupMode: .readOnly,
+                        allowedRoot: self.homeDirectory,
+                        targets: [trashURL],
+                        sizeBytes: trashSize,
+                        guidance: "点击底部「打开废纸篓」并在 Finder 确认清倒后即可释放空间"
+                    ))
+                }
+            }
+
+            let sorted = Self.deduplicateAndSort(updated)
+            return (Self.readVolumeStats(), sorted)
+        }
+    }
+
+    public static func deduplicateAndSort(_ items: [ScanItem]) -> [ScanItem] {
         var seenIDs = Set<String>()
         var uniqueItems: [ScanItem] = []
-        for item in collected {
+        uniqueItems.reserveCapacity(items.count)
+        for item in items {
             if seenIDs.insert(item.id).inserted {
                 uniqueItems.append(item)
             }
@@ -403,13 +600,38 @@ public final class DiskScanner: Sendable {
             if lOrder != rOrder { return lOrder < rOrder }
             return lhs.sizeBytes > rhs.sizeBytes
         }
+        return uniqueItems
+    }
 
-        let elapsed = Date().timeIntervalSince(start)
-        return ScanResult(
-            volumeStats: volumeStats,
-            fdaStatus: fdaStatus,
-            items: uniqueItems,
-            durationSeconds: elapsed
-        )
+    private static func normalizePath(_ path: String) -> String {
+        guard path.count > 1 else { return path }
+        var result = path
+        while result.count > 1 && result.hasSuffix("/") {
+            result.removeLast()
+        }
+        return result
+    }
+
+    private static func minimumSizeThreshold(for item: ScanItem) -> Int64 {
+        if item.id.hasPrefix("tier1.cache.other.") {
+            return 20_000_000
+        }
+        if item.tier == .safe || item.tier == .caution {
+            return RuleCatalog.minimumThresholdBytes
+        }
+        if item.id == "tier3.trash" {
+            return RuleCatalog.minimumThresholdBytes
+        }
+        if item.id.hasPrefix("tier3.app.") || item.id.hasPrefix("tier3.appsupport.") {
+            return 500_000_000
+        }
+        if item.id.hasPrefix("tier3.home.") {
+            let isBackup = item.displayPathURL.lastPathComponent.localizedCaseInsensitiveContains("backup")
+            return isBackup ? 50_000_000 : 1_000_000_000
+        }
+        if item.sizeBytes == 0 {
+            return 0
+        }
+        return 100_000_000
     }
 }
