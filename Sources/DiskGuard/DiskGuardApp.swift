@@ -21,10 +21,10 @@ struct DiskGuardApp: App {
     var body: some Scene {
         WindowGroup("DiskGuard") {
             MainView(viewModel: viewModel)
-                .frame(minWidth: 880, minHeight: 600)
+                .frame(minWidth: 920, minHeight: 640)
                 .preferredColorScheme(preferredScheme)
         }
-        .defaultSize(width: 1040, height: 720)
+        .defaultSize(width: 1060, height: 760)
         .windowStyle(.hiddenTitleBar)
     }
 

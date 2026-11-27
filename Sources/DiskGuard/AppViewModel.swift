@@ -75,6 +75,29 @@ public final class AppViewModel: ObservableObject {
     @Published public var activeBrowser: BrowserContext?
     @Published public var updateState: UpdateState = .idle
     @Published public var showingUpdateSheet: Bool = false
+    @Published public var systemSnapshot: SystemSnapshot
+    @Published public var cpuHistory: [Double] = []
+    @Published public var memoryHistory: [Double] = []
+    @Published public var isMainWindowMinimized: Bool = false
+    @Published public var hudDismissedForCurrentMinimize: Bool = false
+    @Published public var floatingHUDOnMinimize: Bool = true {
+        didSet {
+            guard !isInitializing else { return }
+            preferences.floatingHUDOnMinimize = floatingHUDOnMinimize
+        }
+    }
+    @Published public var floatingHUDAlwaysOn: Bool = false {
+        didSet {
+            guard !isInitializing else { return }
+            preferences.floatingHUDAlwaysOn = floatingHUDAlwaysOn
+        }
+    }
+    @Published public var floatingHUDStyle: FloatingHUDStyle = .transparent {
+        didSet {
+            guard !isInitializing else { return }
+            preferences.floatingHUDStyle = floatingHUDStyle
+        }
+    }
     @Published public var collapsedTiers: Set<RiskTier> = [] {
         didSet {
             guard !isInitializing else { return }
@@ -87,21 +110,29 @@ public final class AppViewModel: ObservableObject {
     public let currentBuildNumber: String = AppUpdater.currentBuildNumber()
 
     private let preferences: UserPreferences
+    private let systemSampler: SystemMonitorSampler
     private var isInitializing = true
     private var scanTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
     private var updateTask: Task<Void, Never>?
+    private var monitorTask: Task<Void, Never>?
     private var hasAutoCheckedUpdate = false
     private var scanGeneration: UInt64 = 0
     private var streamedByID: [String: ScanItem] = [:]
     private var lastStreamPublish: ContinuousClock.Instant?
 
     public init(preferences: UserPreferences = UserPreferences()) {
+        let sampler = SystemMonitorSampler()
+        self.systemSampler = sampler
+        self.systemSnapshot = sampler.sample(includeTopProcesses: false)
         self.preferences = preferences
         self.appearanceMode = preferences.appearanceMode
         self.collapsedTiers = preferences.collapsedTiers
         self.activeFilter = FilterTab(rawValue: preferences.activeFilterRawValue) ?? .all
         self.isLogDrawerExpanded = preferences.isLogDrawerExpanded
+        self.floatingHUDOnMinimize = preferences.floatingHUDOnMinimize
+        self.floatingHUDAlwaysOn = preferences.floatingHUDAlwaysOn
+        self.floatingHUDStyle = preferences.floatingHUDStyle
         self.isInitializing = false
         applyAppAppearance()
     }
@@ -510,6 +541,83 @@ public final class AppViewModel: ObservableObject {
                 self.appendLog(level: .error, message: "更新失败：\(msg)")
                 self.isLogDrawerExpanded = true
             }
+        }
+    }
+
+    // MARK: - System Monitor & Floating HUD
+
+    public var shouldShowFloatingHUD: Bool {
+        floatingHUDAlwaysOn || (floatingHUDOnMinimize && isMainWindowMinimized && !hudDismissedForCurrentMinimize)
+    }
+
+    public func setMainWindowMinimized(_ minimized: Bool) {
+        isMainWindowMinimized = minimized
+        if !minimized {
+            hudDismissedForCurrentMinimize = false
+        }
+    }
+
+    public func toggleFloatingHUDPin() {
+        floatingHUDAlwaysOn.toggle()
+    }
+
+    public func dismissFloatingHUD() {
+        floatingHUDAlwaysOn = false
+        if isMainWindowMinimized {
+            hudDismissedForCurrentMinimize = true
+        }
+    }
+
+    public func startSystemMonitoring() {
+        guard monitorTask == nil else { return }
+        let sampler = systemSampler
+        monitorTask = Task { [weak self] in
+            var tickCount = 0
+            while !Task.isCancelled {
+                guard let self else { return }
+                let minimized = self.isMainWindowMinimized
+                let needProcesses = !minimized && (tickCount % 3 == 0)
+                let refreshDisk = (tickCount > 0 && tickCount % 10 == 0 && !self.isScanning && !self.isCleaning)
+
+                let sampled = await DiskScanner.runOnIOQueue {
+                    sampler.sample(includeTopProcesses: needProcesses, topLimit: 5)
+                }
+                if Task.isCancelled { return }
+
+                let mergedSnapshot = SystemSnapshot(
+                    timestamp: sampled.timestamp,
+                    memory: sampled.memory,
+                    cpu: sampled.cpu,
+                    topProcesses: needProcesses ? sampled.topProcesses : self.systemSnapshot.topProcesses
+                )
+                self.systemSnapshot = mergedSnapshot
+                self.appendMonitorSample(mergedSnapshot.cpu.totalUsage, to: &self.cpuHistory)
+                self.appendMonitorSample(mergedSnapshot.memory.usedRatio, to: &self.memoryHistory)
+
+                if refreshDisk {
+                    let stats = await DiskScanner.runOnIOQueue {
+                        DiskScanner.readVolumeStats()
+                    }
+                    if !Task.isCancelled {
+                        self.volumeStats = stats
+                    }
+                }
+
+                tickCount &+= 1
+                try? await Task.sleep(for: .milliseconds(1500))
+            }
+        }
+    }
+
+    public func stopSystemMonitoring() {
+        monitorTask?.cancel()
+        monitorTask = nil
+    }
+
+    private func appendMonitorSample(_ value: Double, to history: inout [Double]) {
+        history.append(value)
+        if history.count > 24 {
+            history.removeFirst(history.count - 24)
         }
     }
 

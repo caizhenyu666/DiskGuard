@@ -12,6 +12,9 @@ public struct UserPreferences: Sendable {
         static let collapsedTiers = "diskguard.collapsedTiers"
         static let activeFilter = "diskguard.activeFilter"
         static let isLogDrawerExpanded = "diskguard.isLogDrawerExpanded"
+        static let floatingHUDOnMinimize = "diskguard.floatingHUDOnMinimize"
+        static let floatingHUDAlwaysOn = "diskguard.floatingHUDAlwaysOn"
+        static let floatingHUDStyle = "diskguard.floatingHUDStyle"
     }
 
     private var defaults: UserDefaults {
@@ -61,6 +64,40 @@ public struct UserPreferences: Sendable {
         }
         nonmutating set {
             defaults.set(newValue, forKey: Keys.isLogDrawerExpanded)
+        }
+    }
+
+    public var floatingHUDOnMinimize: Bool {
+        get {
+            if defaults.object(forKey: Keys.floatingHUDOnMinimize) == nil {
+                return true
+            }
+            return defaults.bool(forKey: Keys.floatingHUDOnMinimize)
+        }
+        nonmutating set {
+            defaults.set(newValue, forKey: Keys.floatingHUDOnMinimize)
+        }
+    }
+
+    public var floatingHUDAlwaysOn: Bool {
+        get {
+            defaults.bool(forKey: Keys.floatingHUDAlwaysOn)
+        }
+        nonmutating set {
+            defaults.set(newValue, forKey: Keys.floatingHUDAlwaysOn)
+        }
+    }
+
+    public var floatingHUDStyle: FloatingHUDStyle {
+        get {
+            guard let raw = defaults.string(forKey: Keys.floatingHUDStyle),
+                  let style = FloatingHUDStyle(rawValue: raw) else {
+                return .transparent
+            }
+            return style
+        }
+        nonmutating set {
+            defaults.set(newValue.rawValue, forKey: Keys.floatingHUDStyle)
         }
     }
 }

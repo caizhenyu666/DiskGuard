@@ -3,6 +3,7 @@ import DiskGuardCore
 
 struct MainView: View {
     @ObservedObject var viewModel: AppViewModel
+    @StateObject private var floatingController = FloatingMonitorController()
     @State private var hoveredID: String?
 
     var body: some View {
@@ -27,12 +28,21 @@ struct MainView: View {
             bottomDrawerSection
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .background(
+            MainWindowAccessor { window in
+                floatingController.attach(mainWindow: window, viewModel: viewModel)
+            }
+        )
         .onAppear {
             viewModel.applyAppAppearance()
+            viewModel.startSystemMonitoring()
             if viewModel.items.isEmpty && !viewModel.isScanning {
                 viewModel.startScan()
             }
             viewModel.checkForUpdatesOnLaunchIfNeeded()
+        }
+        .onChange(of: viewModel.shouldShowFloatingHUD) { _, _ in
+            floatingController.syncVisibility(viewModel: viewModel)
         }
         .sheet(isPresented: $viewModel.showingUpdateSheet) {
             UpdateSheet(viewModel: viewModel)
@@ -108,6 +118,8 @@ struct MainView: View {
             }
 
             capacityBarCard
+
+            SystemMonitorCard(viewModel: viewModel)
 
             if case .missing(let blocked) = viewModel.fdaStatus {
                 fdaBanner(blockedPaths: blocked)
