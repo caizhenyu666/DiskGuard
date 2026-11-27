@@ -8,20 +8,39 @@ struct MainView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            headerSection
+            topNavigationBar
                 .padding(.horizontal, 24)
-                .padding(.top, 20)
-                .padding(.bottom, 14)
+                .padding(.top, 14)
+                .padding(.bottom, 12)
 
             Divider()
 
-            toolbarSection
-                .padding(.horizontal, 24)
-                .padding(.vertical, 12)
+            switch viewModel.activeSection {
+            case .storage:
+                storageHeaderSection
+                    .padding(.horizontal, 24)
+                    .padding(.top, 12)
+                    .padding(.bottom, 10)
 
-            Divider()
+                Divider()
 
-            contentListSection
+                toolbarSection
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 10)
+
+                Divider()
+
+                contentListSection
+
+            case .memory:
+                MemoryTabView(viewModel: viewModel)
+
+            case .cpu:
+                CPUTabView(viewModel: viewModel)
+
+            case .health:
+                SystemHealthView(viewModel: viewModel)
+            }
 
             Divider()
 
@@ -44,6 +63,26 @@ struct MainView: View {
         .onChange(of: viewModel.shouldShowFloatingHUD) { _, _ in
             floatingController.syncVisibility(viewModel: viewModel)
         }
+        .onChange(of: viewModel.floatingHUDCollapsed) { _, _ in
+            floatingController.updatePanelSize(viewModel: viewModel)
+        }
+        .alert(
+            viewModel.pendingProcessTermination?.title ?? "",
+            isPresented: Binding(
+                get: { viewModel.pendingProcessTermination != nil },
+                set: { if !$0 { viewModel.cancelPendingProcessTermination() } }
+            ),
+            presenting: viewModel.pendingProcessTermination
+        ) { _ in
+            Button("取消", role: .cancel) {
+                viewModel.cancelPendingProcessTermination()
+            }
+            Button("强制结束", role: .destructive) {
+                viewModel.confirmPendingProcessTermination()
+            }
+        } message: { action in
+            Text(action.message)
+        }
         .sheet(isPresented: $viewModel.showingUpdateSheet) {
             UpdateSheet(viewModel: viewModel)
         }
@@ -62,64 +101,151 @@ struct MainView: View {
         }
     }
 
-    // MARK: - Header & Capacity Bar
+    // MARK: - Top Navigation Bar
 
-    private var headerSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top) {
-                HStack(spacing: 12) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(
-                                LinearGradient(
-                                    colors: [Color.accentColor.opacity(0.9), Color.teal],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
+    private var topNavigationBar: some View {
+        HStack(spacing: 14) {
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [Color.accentColor.opacity(0.9), Color.teal],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
                             )
-                            .frame(width: 38, height: 38)
-                        Image(systemName: "externaldrive.badge.checkmark")
-                            .font(.system(size: 18, weight: .semibold))
-                            .foregroundStyle(.white)
-                    }
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 8) {
-                            Text("DiskGuard · macOS 存储管理")
-                                .font(.system(size: 18, weight: .semibold))
-                            versionPill
-                        }
-                        Text("只清理可重建缓存与明确确认的残留，默认移入废纸篓，绝不动你的文档与代码")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                    }
+                        )
+                        .frame(width: 32, height: 32)
+                    Image(systemName: "externaldrive.badge.checkmark")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.white)
                 }
 
-                Spacer()
-
-                VStack(alignment: .trailing, spacing: 2) {
-                    HStack(spacing: 4) {
-                        Text("可用")
-                            .foregroundStyle(.secondary)
-                        Text(DiskByteFormatter.string(from: viewModel.volumeStats.importantAvailableBytes))
-                            .fontWeight(.semibold)
-                            .foregroundStyle(viewModel.volumeStats.importantAvailableBytes < 20_000_000_000 ? .orange : .primary)
-                        Text("/ 共 \(DiskByteFormatter.string(from: viewModel.volumeStats.totalBytes))")
-                            .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 6) {
+                        Text("DiskGuard")
+                            .font(.system(size: 16, weight: .semibold))
+                        versionPill
                     }
-                    .font(.system(size: 13).monospacedDigit())
-
-                    if viewModel.volumeStats.purgeableBytes > 1_000_000_000 {
-                        Text("物理空闲 \(DiskByteFormatter.string(from: viewModel.volumeStats.physicalAvailableBytes)) · 含系统可清除空间 \(DiskByteFormatter.string(from: viewModel.volumeStats.purgeableBytes))")
-                            .font(.system(size: 11).monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
+                    Text("macOS 存储与系统监控")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
             }
 
-            capacityBarCard
+            Spacer()
 
-            SystemMonitorCard(viewModel: viewModel)
+            HStack(spacing: 4) {
+                ForEach(MainSectionTab.allCases) { tab in
+                    sectionTabButton(tab)
+                }
+            }
+            .padding(3)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+            )
+
+            Spacer()
+
+            HStack(spacing: 6) {
+                updateToolbarButton
+
+                Button {
+                    viewModel.toggleFloatingHUDPin()
+                } label: {
+                    Image(systemName: viewModel.floatingHUDAlwaysOn ? "pip.fill" : "pip.enter")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.bordered)
+                .tint(viewModel.floatingHUDAlwaysOn ? .accentColor : nil)
+                .help(viewModel.floatingHUDAlwaysOn ? "取消常驻右上角悬浮窗" : "在屏幕右上角常驻透明悬浮窗（最小化时也会自动显示）")
+
+                Button {
+                    viewModel.appearanceMode = viewModel.appearanceMode.next
+                } label: {
+                    Image(systemName: appearanceIcon)
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.bordered)
+                .help("外观模式：\(viewModel.appearanceMode.displayName)（点击切换）")
+            }
+        }
+    }
+
+    private func sectionTabButton(_ tab: MainSectionTab) -> some View {
+        let isSelected = viewModel.activeSection == tab
+        let liveTag: String? = {
+            switch tab {
+            case .storage:
+                return nil
+            case .memory:
+                return "\(Int((viewModel.systemSnapshot.memory.usedRatio * 100).rounded()))%"
+            case .cpu:
+                return String(format: "%.0f%%", viewModel.systemSnapshot.cpu.totalUsage * 100)
+            case .health:
+                return nil
+            }
+        }()
+
+        return Button {
+            viewModel.activeSection = tab
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: tab.icon)
+                    .font(.system(size: 11.5, weight: .medium))
+                Text(tab.title)
+                    .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+                if let liveTag {
+                    Text(liveTag)
+                        .font(.system(size: 10, weight: .medium).monospacedDigit())
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(isSelected ? Color.white.opacity(0.22) : Color.primary.opacity(0.07))
+                        .clipShape(Capsule())
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(isSelected ? Color.accentColor : Color.clear)
+            .foregroundStyle(isSelected ? .white : .primary)
+            .clipShape(RoundedRectangle(cornerRadius: 6.5, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Storage Header & Capacity Bar
+
+    private var storageHeaderSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("本地磁盘空间与安全清理")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("· 默认仅移入废纸篓，绝不动你的文档与代码")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                HStack(spacing: 4) {
+                    Text("可用")
+                        .foregroundStyle(.secondary)
+                    Text(DiskByteFormatter.string(from: viewModel.volumeStats.importantAvailableBytes))
+                        .fontWeight(.semibold)
+                        .foregroundStyle(viewModel.volumeStats.importantAvailableBytes < 20_000_000_000 ? .orange : .primary)
+                    Text("/ 共 \(DiskByteFormatter.string(from: viewModel.volumeStats.totalBytes))")
+                        .foregroundStyle(.secondary)
+                    if viewModel.volumeStats.purgeableBytes > 1_000_000_000 {
+                        Text("（物理空闲 \(DiskByteFormatter.string(from: viewModel.volumeStats.physicalAvailableBytes))）")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .font(.system(size: 12).monospacedDigit())
+            }
+
+            capacityBarCard
 
             if case .missing(let blocked) = viewModel.fdaStatus {
                 fdaBanner(blockedPaths: blocked)
@@ -311,16 +437,6 @@ struct MainView: View {
                 .disabled(viewModel.selectedIDs.isEmpty || viewModel.isCleaning)
 
                 Spacer()
-
-                updateToolbarButton
-
-                Button {
-                    viewModel.appearanceMode = viewModel.appearanceMode.next
-                } label: {
-                    Label(viewModel.appearanceMode.displayName, systemImage: appearanceIcon)
-                }
-                .buttonStyle(.bordered)
-                .help("切换外观模式（自动 / 浅色 / 深色）")
 
                 Button {
                     viewModel.startScan()

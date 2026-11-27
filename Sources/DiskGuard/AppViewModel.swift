@@ -39,6 +39,40 @@ public enum UpdateState: Equatable {
     case failed(String)
 }
 
+public enum PendingProcessAction: Identifiable {
+    case forceGroup(ProcessGroup)
+    case forceProcess(ProcessEntry)
+
+    public var id: String {
+        switch self {
+        case .forceGroup(let group):
+            return "group.\(group.id)"
+        case .forceProcess(let proc):
+            return "proc.\(proc.pid)"
+        }
+    }
+
+    public var title: String {
+        switch self {
+        case .forceGroup(let group):
+            return group.processCount > 1
+                ? "强制结束「\(group.displayName)」全部 \(group.processCount) 个进程？"
+                : "强制结束「\(group.displayName)」？"
+        case .forceProcess(let proc):
+            return "强制结束进程「\(proc.name)」(PID \(proc.pid))？"
+        }
+    }
+
+    public var message: String {
+        switch self {
+        case .forceGroup(let group):
+            return "将向「\(group.displayName)」的 \(group.processCount) 个进程发送强制终止信号（SIGKILL），未保存的更改可能会丢失。"
+        case .forceProcess(let proc):
+            return "将向进程 \(proc.name)（PID \(proc.pid)）发送强制终止信号（SIGKILL），未保存的更改可能会丢失。"
+        }
+    }
+}
+
 @MainActor
 public final class AppViewModel: ObservableObject {
     @Published public var volumeStats: VolumeStats = DiskScanner.readVolumeStats()
@@ -75,9 +109,19 @@ public final class AppViewModel: ObservableObject {
     @Published public var activeBrowser: BrowserContext?
     @Published public var updateState: UpdateState = .idle
     @Published public var showingUpdateSheet: Bool = false
+    @Published public var activeSection: MainSectionTab = .storage {
+        didSet {
+            guard !isInitializing else { return }
+            preferences.activeMainSectionRawValue = activeSection.rawValue
+        }
+    }
     @Published public var systemSnapshot: SystemSnapshot
     @Published public var cpuHistory: [Double] = []
     @Published public var memoryHistory: [Double] = []
+    @Published public var networkDownHistory: [Double] = []
+    @Published public var processSearchText: String = ""
+    @Published public var onlyClosableProcesses: Bool = false
+    @Published public var pendingProcessTermination: PendingProcessAction?
     @Published public var isMainWindowMinimized: Bool = false
     @Published public var hudDismissedForCurrentMinimize: Bool = false
     @Published public var floatingHUDOnMinimize: Bool = true {
@@ -96,6 +140,12 @@ public final class AppViewModel: ObservableObject {
         didSet {
             guard !isInitializing else { return }
             preferences.floatingHUDStyle = floatingHUDStyle
+        }
+    }
+    @Published public var floatingHUDCollapsed: Bool = false {
+        didSet {
+            guard !isInitializing else { return }
+            preferences.floatingHUDCollapsed = floatingHUDCollapsed
         }
     }
     @Published public var collapsedTiers: Set<RiskTier> = [] {
@@ -133,6 +183,8 @@ public final class AppViewModel: ObservableObject {
         self.floatingHUDOnMinimize = preferences.floatingHUDOnMinimize
         self.floatingHUDAlwaysOn = preferences.floatingHUDAlwaysOn
         self.floatingHUDStyle = preferences.floatingHUDStyle
+        self.floatingHUDCollapsed = preferences.floatingHUDCollapsed
+        self.activeSection = MainSectionTab(rawValue: preferences.activeMainSectionRawValue) ?? .storage
         self.isInitializing = false
         applyAppAppearance()
     }
@@ -572,6 +624,10 @@ public final class AppViewModel: ObservableObject {
         floatingHUDAlwaysOn.toggle()
     }
 
+    public func toggleFloatingHUDCollapsed() {
+        floatingHUDCollapsed.toggle()
+    }
+
     public func dismissFloatingHUD() {
         floatingHUDAlwaysOn = false
         if isMainWindowMinimized {
@@ -579,31 +635,117 @@ public final class AppViewModel: ObservableObject {
         }
     }
 
+    public var memoryProcessGroups: [ProcessGroup] {
+        filteredProcessGroups(sortedBy: .memory)
+    }
+
+    public var cpuProcessGroups: [ProcessGroup] {
+        filteredProcessGroups(sortedBy: .cpu)
+    }
+
+    private func filteredProcessGroups(sortedBy metric: ProcessSortMetric) -> [ProcessGroup] {
+        let grouped = SystemMonitorSampler.groupProcesses(systemSnapshot.processes, sortBy: metric)
+        let query = processSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return grouped.filter { group in
+            if onlyClosableProcesses && group.isProtected {
+                return false
+            }
+            if query.isEmpty { return true }
+            if group.displayName.localizedCaseInsensitiveContains(query) {
+                return true
+            }
+            return group.processes.contains { proc in
+                proc.name.localizedCaseInsensitiveContains(query) || String(proc.pid).contains(query)
+            }
+        }
+    }
+
+    public func terminateGroup(_ group: ProcessGroup, mode: ProcessController.TerminateMode) {
+        if mode == .force {
+            pendingProcessTermination = .forceGroup(group)
+            return
+        }
+        executeTerminateGroup(group, mode: mode)
+    }
+
+    public func terminateProcess(_ process: ProcessEntry, mode: ProcessController.TerminateMode) {
+        if mode == .force {
+            pendingProcessTermination = .forceProcess(process)
+            return
+        }
+        executeTerminateProcess(process, mode: mode)
+    }
+
+    public func cancelPendingProcessTermination() {
+        pendingProcessTermination = nil
+    }
+
+    public func confirmPendingProcessTermination() {
+        guard let action = pendingProcessTermination else { return }
+        pendingProcessTermination = nil
+        switch action {
+        case .forceGroup(let group):
+            executeTerminateGroup(group, mode: .force)
+        case .forceProcess(let proc):
+            executeTerminateProcess(proc, mode: .force)
+        }
+    }
+
+    private func executeTerminateGroup(_ group: ProcessGroup, mode: ProcessController.TerminateMode) {
+        Task {
+            let report = await DiskScanner.runOnIOQueue {
+                ProcessController.terminate(group: group, mode: mode)
+            }
+            if report.signaledCount > 0 {
+                self.appendLog(
+                    level: .success,
+                    message: "已\(mode.actionLabel)「\(report.targetName)」共 \(report.signaledCount) 个进程。"
+                )
+            } else {
+                self.appendLog(
+                    level: .warning,
+                    message: report.errorMessage ?? "未能\(mode.actionLabel)「\(report.targetName)」。"
+                )
+            }
+            try? await Task.sleep(for: .milliseconds(450))
+            await self.sampleSystemNow(includeProcesses: true)
+        }
+    }
+
+    private func executeTerminateProcess(_ process: ProcessEntry, mode: ProcessController.TerminateMode) {
+        Task {
+            let report = await DiskScanner.runOnIOQueue {
+                ProcessController.terminate(process: process, mode: mode)
+            }
+            if report.signaledCount > 0 {
+                self.appendLog(
+                    level: .success,
+                    message: "已\(mode.actionLabel)进程「\(report.targetName)」(PID \(process.pid))。"
+                )
+            } else {
+                self.appendLog(
+                    level: .warning,
+                    message: report.errorMessage ?? "未能\(mode.actionLabel)进程「\(report.targetName)」。"
+                )
+            }
+            try? await Task.sleep(for: .milliseconds(450))
+            await self.sampleSystemNow(includeProcesses: true)
+        }
+    }
+
     public func startSystemMonitoring() {
         guard monitorTask == nil else { return }
-        let sampler = systemSampler
         monitorTask = Task { [weak self] in
             var tickCount = 0
             while !Task.isCancelled {
                 guard let self else { return }
                 let minimized = self.isMainWindowMinimized
-                let needProcesses = !minimized && (tickCount % 3 == 0)
+                let onProcessTab = (self.activeSection == .memory || self.activeSection == .cpu)
+                let needProcesses = !minimized && (onProcessTab || tickCount % 3 == 0)
                 let refreshDisk = (tickCount > 0 && tickCount % 10 == 0 && !self.isScanning && !self.isCleaning)
 
-                let sampled = await DiskScanner.runOnIOQueue {
-                    sampler.sample(includeTopProcesses: needProcesses, topLimit: 5)
-                }
+                await self.sampleSystemNow(includeProcesses: needProcesses)
                 if Task.isCancelled { return }
-
-                let mergedSnapshot = SystemSnapshot(
-                    timestamp: sampled.timestamp,
-                    memory: sampled.memory,
-                    cpu: sampled.cpu,
-                    topProcesses: needProcesses ? sampled.topProcesses : self.systemSnapshot.topProcesses
-                )
-                self.systemSnapshot = mergedSnapshot
-                self.appendMonitorSample(mergedSnapshot.cpu.totalUsage, to: &self.cpuHistory)
-                self.appendMonitorSample(mergedSnapshot.memory.usedRatio, to: &self.memoryHistory)
 
                 if refreshDisk {
                     let stats = await DiskScanner.runOnIOQueue {
@@ -618,6 +760,27 @@ public final class AppViewModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(1500))
             }
         }
+    }
+
+    public func sampleSystemNow(includeProcesses: Bool) async {
+        let sampler = systemSampler
+        let sampled = await DiskScanner.runOnIOQueue {
+            sampler.sample(includeTopProcesses: includeProcesses, topLimit: 8)
+        }
+        if Task.isCancelled { return }
+
+        let mergedSnapshot = SystemSnapshot(
+            timestamp: sampled.timestamp,
+            memory: sampled.memory,
+            cpu: sampled.cpu,
+            topProcesses: includeProcesses ? sampled.topProcesses : self.systemSnapshot.topProcesses,
+            processes: includeProcesses ? sampled.processes : self.systemSnapshot.processes,
+            health: sampled.health
+        )
+        self.systemSnapshot = mergedSnapshot
+        self.appendMonitorSample(mergedSnapshot.cpu.totalUsage, to: &self.cpuHistory)
+        self.appendMonitorSample(mergedSnapshot.memory.usedRatio, to: &self.memoryHistory)
+        self.appendMonitorSample(mergedSnapshot.health.network.downloadBytesPerSec, to: &self.networkDownHistory)
     }
 
     public func stopSystemMonitoring() {

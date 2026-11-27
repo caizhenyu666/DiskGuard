@@ -15,6 +15,8 @@ public struct UserPreferences: Sendable {
         static let floatingHUDOnMinimize = "diskguard.floatingHUDOnMinimize"
         static let floatingHUDAlwaysOn = "diskguard.floatingHUDAlwaysOn"
         static let floatingHUDStyle = "diskguard.floatingHUDStyle"
+        static let floatingHUDCollapsed = "diskguard.floatingHUDCollapsed"
+        static let activeMainSection = "diskguard.activeMainSection"
     }
 
     private var defaults: UserDefaults {
@@ -98,6 +100,24 @@ public struct UserPreferences: Sendable {
         }
         nonmutating set {
             defaults.set(newValue.rawValue, forKey: Keys.floatingHUDStyle)
+        }
+    }
+
+    public var floatingHUDCollapsed: Bool {
+        get {
+            defaults.bool(forKey: Keys.floatingHUDCollapsed)
+        }
+        nonmutating set {
+            defaults.set(newValue, forKey: Keys.floatingHUDCollapsed)
+        }
+    }
+
+    public var activeMainSectionRawValue: String {
+        get {
+            defaults.string(forKey: Keys.activeMainSection) ?? "storage"
+        }
+        nonmutating set {
+            defaults.set(newValue, forKey: Keys.activeMainSection)
         }
     }
 }

@@ -31,138 +31,36 @@ struct FloatingMonitorView: View {
 
     private var memory: MemoryStats { viewModel.systemSnapshot.memory }
     private var cpu: CPUStats { viewModel.systemSnapshot.cpu }
+    private var health: MacHealthStats { viewModel.systemSnapshot.health }
     private var isTransparent: Bool { viewModel.floatingHUDStyle == .transparent }
 
     private var pressureColor: Color {
         switch memory.pressure {
-        case .normal: return .green
-        case .warning: return .orange
-        case .critical: return .red
+        case .normal: return Color(red: 0.22, green: 0.85, blue: 0.56)
+        case .warning: return Color(red: 0.98, green: 0.65, blue: 0.20)
+        case .critical: return Color(red: 0.96, green: 0.34, blue: 0.34)
         }
     }
 
+    private var cpuAccentColor: Color {
+        if cpu.totalUsage >= 0.8 { return Color(red: 0.96, green: 0.42, blue: 0.30) }
+        if cpu.totalUsage >= 0.5 { return Color(red: 0.98, green: 0.68, blue: 0.22) }
+        return Color(red: 0.22, green: 0.78, blue: 0.86)
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Image(systemName: "externaldrive.badge.checkmark")
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(.teal)
-                Text("DiskGuard")
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(primaryTextColor)
-
-                Spacer()
-
-                if isHovered {
-                    Button {
-                        onRestoreMainWindow()
-                    } label: {
-                        Image(systemName: "arrow.up.left.and.arrow.down.right")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .frame(width: 18, height: 18)
-                            .background(Color.primary.opacity(isTransparent ? 0.22 : 0.1))
-                            .clipShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("还原 DiskGuard 主窗口")
-
-                    Button {
-                        viewModel.dismissFloatingHUD()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .frame(width: 18, height: 18)
-                            .background(Color.primary.opacity(isTransparent ? 0.22 : 0.1))
-                            .clipShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("隐藏悬浮窗")
-                } else {
-                    Text(String(format: "负载 %.2f", cpu.loadAverage1m))
-                        .font(.system(size: 10).monospacedDigit())
-                        .foregroundStyle(secondaryTextColor)
-                }
-            }
-
-            // Memory Row
-            HStack(spacing: 6) {
-                Image(systemName: "memorychip")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(pressureColor)
-                    .frame(width: 13)
-
-                Text("内存")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(primaryTextColor)
-
-                miniProgressBar(fraction: memory.usedRatio, tint: pressureColor)
-
-                Text("\(Int((memory.usedRatio * 100).rounded()))% · \(MemoryByteFormatter.string(from: memory.usedBytes))")
-                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
-                    .foregroundStyle(primaryTextColor)
-                    .lineLimit(1)
-            }
-
-            // CPU Row
-            HStack(spacing: 6) {
-                Image(systemName: "cpu")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.teal)
-                    .frame(width: 13)
-
-                Text("CPU")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(primaryTextColor)
-
-                miniProgressBar(fraction: cpu.totalUsage, tint: cpu.totalUsage >= 0.8 ? .orange : .teal)
-
-                Text(String(format: "%.1f%%", cpu.totalUsage * 100))
-                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
-                    .foregroundStyle(primaryTextColor)
-                    .frame(minWidth: 42, alignment: .trailing)
-            }
-
-            // Disk & Swap Row
-            HStack(spacing: 6) {
-                Image(systemName: "internaldrive")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(viewModel.volumeStats.importantAvailableBytes < 20_000_000_000 ? .orange : .secondary)
-                    .frame(width: 13)
-
-                Text("磁盘可用 \(DiskByteFormatter.string(from: viewModel.volumeStats.importantAvailableBytes))")
-                    .font(.system(size: 10.5).monospacedDigit())
-                    .foregroundStyle(secondaryTextColor)
-
-                Spacer(minLength: 4)
-
-                if memory.swapUsedBytes >= 1_000_000_000 {
-                    Text("Swap \(MemoryByteFormatter.string(from: memory.swapUsedBytes))")
-                        .font(.system(size: 9.5, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.orange)
-                }
+        Group {
+            if viewModel.floatingHUDCollapsed {
+                collapsedPillView
+            } else {
+                expandedHUDView
             }
         }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 9)
-        .frame(width: 236)
-        .background(hudBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(
-                    isTransparent ? Color.white.opacity(isHovered ? 0.35 : 0.18) : Color.primary.opacity(0.14),
-                    lineWidth: 1
-                )
-        )
-        .shadow(
-            color: isTransparent ? Color.black.opacity(0.55) : .clear,
-            radius: isTransparent ? 2 : 0,
-            x: 0,
-            y: isTransparent ? 1 : 0
-        )
         .contentShape(Rectangle())
         .onHover { hovering in
-            isHovered = hovering
+            withAnimation(.easeOut(duration: 0.16)) {
+                isHovered = hovering
+            }
         }
         .onTapGesture(count: 2) {
             onRestoreMainWindow()
@@ -170,6 +68,9 @@ struct FloatingMonitorView: View {
         .contextMenu {
             Button("还原 DiskGuard 主窗口") {
                 onRestoreMainWindow()
+            }
+            Button(viewModel.floatingHUDCollapsed ? "展开悬浮监控窗" : "收起为迷你胶囊") {
+                viewModel.toggleFloatingHUDCollapsed()
             }
             Divider()
             Picker("背景样式", selection: $viewModel.floatingHUDStyle) {
@@ -186,12 +87,276 @@ struct FloatingMonitorView: View {
         }
     }
 
+    // MARK: - Collapsed Mini Pill
+
+    private var collapsedPillView: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(pressureColor)
+                .frame(width: 7, height: 7)
+
+            HStack(spacing: 4) {
+                Text("内存")
+                    .foregroundStyle(secondaryTextColor)
+                Text("\(Int((memory.usedRatio * 100).rounded()))%")
+                    .fontWeight(.semibold)
+                    .foregroundStyle(primaryTextColor)
+            }
+
+            Rectangle()
+                .fill(dividerColor)
+                .frame(width: 1, height: 11)
+
+            HStack(spacing: 4) {
+                Text("CPU")
+                    .foregroundStyle(secondaryTextColor)
+                Text(String(format: "%.0f%%", cpu.totalUsage * 100))
+                    .fontWeight(.semibold)
+                    .foregroundStyle(cpuAccentColor)
+            }
+
+            Button {
+                viewModel.toggleFloatingHUDCollapsed()
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9.5, weight: .bold))
+                    .foregroundStyle(primaryTextColor)
+                    .frame(width: 18, height: 18)
+                    .background(buttonChipFill)
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .help("展开悬浮监控窗")
+        }
+        .font(.system(size: 11).monospacedDigit())
+        .padding(.horizontal, 11)
+        .padding(.vertical, 7)
+        .background(hudBackground)
+        .clipShape(Capsule())
+        .overlay(
+            Capsule()
+                .strokeBorder(borderGradient, lineWidth: 1)
+        )
+        .shadow(
+            color: isTransparent ? Color.black.opacity(0.45) : .clear,
+            radius: isTransparent ? 2 : 0,
+            x: 0,
+            y: isTransparent ? 1 : 0
+        )
+    }
+
+    // MARK: - Expanded HUD
+
+    private var expandedHUDView: some View {
+        VStack(spacing: 9) {
+            // Top bar
+            HStack(spacing: 6) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [Color.teal.opacity(0.9), Color.blue.opacity(0.8)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(width: 16, height: 16)
+                    Image(systemName: "externaldrive.badge.checkmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white)
+                }
+
+                Text("DiskGuard")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(primaryTextColor)
+
+                if health.thermal != .nominal {
+                    Circle()
+                        .fill(health.thermal == .fair ? Color.orange : Color.red)
+                        .frame(width: 6, height: 6)
+                        .help("设备温度：\(health.thermal.displayName)")
+                }
+
+                Spacer()
+
+                HStack(spacing: 4) {
+                    hudIconButton(systemName: "chevron.up", help: "收起为迷你胶囊") {
+                        viewModel.toggleFloatingHUDCollapsed()
+                    }
+                    if isHovered {
+                        hudIconButton(systemName: "arrow.up.left.and.arrow.down.right", help: "还原主窗口") {
+                            onRestoreMainWindow()
+                        }
+                        hudIconButton(systemName: "xmark", help: "隐藏悬浮窗") {
+                            viewModel.dismissFloatingHUD()
+                        }
+                    }
+                }
+            }
+
+            // Dual Circular Arc Gauges
+            HStack(spacing: 12) {
+                gaugeBlock(
+                    title: "运行内存",
+                    fraction: memory.usedRatio,
+                    percentText: "\(Int((memory.usedRatio * 100).rounded()))%",
+                    subtitle: "\(MemoryByteFormatter.compactGB(memory.usedBytes))/\(MemoryByteFormatter.compactGB(memory.totalBytes))",
+                    badgeText: memory.pressure.displayName,
+                    tint: pressureColor
+                )
+
+                Rectangle()
+                    .fill(dividerColor)
+                    .frame(width: 1, height: 50)
+
+                gaugeBlock(
+                    title: "CPU",
+                    fraction: cpu.totalUsage,
+                    percentText: String(format: "%.0f%%", cpu.totalUsage * 100),
+                    subtitle: String(format: "负载 %.2f", cpu.loadAverage1m),
+                    badgeText: "\(cpu.coreCount)核",
+                    tint: cpuAccentColor
+                )
+            }
+
+            Rectangle()
+                .fill(dividerColor)
+                .frame(height: 1)
+
+            // Bottom telemetry strip (Network + Disk)
+            HStack(spacing: 8) {
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.down")
+                        .font(.system(size: 8.5, weight: .bold))
+                        .foregroundStyle(.teal)
+                    Text(NetworkSpeedFormatter.compact(bytesPerSec: health.network.downloadBytesPerSec))
+                }
+
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 8.5, weight: .bold))
+                        .foregroundStyle(.blue)
+                    Text(NetworkSpeedFormatter.compact(bytesPerSec: health.network.uploadBytesPerSec))
+                }
+
+                Spacer(minLength: 4)
+
+                HStack(spacing: 3) {
+                    Image(systemName: "internaldrive")
+                        .font(.system(size: 9))
+                        .foregroundStyle(viewModel.volumeStats.importantAvailableBytes < 20_000_000_000 ? .orange : secondaryTextColor)
+                    Text(DiskByteFormatter.string(from: viewModel.volumeStats.importantAvailableBytes))
+                }
+            }
+            .font(.system(size: 10).monospacedDigit())
+            .foregroundStyle(secondaryTextColor)
+            .lineLimit(1)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(width: 254)
+        .background(hudBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(borderGradient, lineWidth: 1)
+        )
+        .shadow(
+            color: isTransparent ? Color.black.opacity(0.55) : .clear,
+            radius: isTransparent ? 2.5 : 0,
+            x: 0,
+            y: isTransparent ? 1 : 0
+        )
+    }
+
+    private func gaugeBlock(
+        title: String,
+        fraction: Double,
+        percentText: String,
+        subtitle: String,
+        badgeText: String,
+        tint: Color
+    ) -> some View {
+        let clamped = min(1.0, max(0.0, fraction))
+        return HStack(spacing: 9) {
+            ZStack {
+                Circle()
+                    .stroke(trackColor, lineWidth: 5)
+                Circle()
+                    .trim(from: 0, to: clamped)
+                    .stroke(
+                        AngularGradient(
+                            colors: [tint.opacity(0.72), tint],
+                            center: .center,
+                            startAngle: .degrees(-90),
+                            endAngle: .degrees(270)
+                        ),
+                        style: StrokeStyle(lineWidth: 5, lineCap: .round)
+                    )
+                    .rotationEffect(.degrees(-90))
+                    .animation(.easeOut(duration: 0.25), value: clamped)
+
+                Text(percentText)
+                    .font(.system(size: 10.5, weight: .bold).monospacedDigit())
+                    .foregroundStyle(primaryTextColor)
+            }
+            .frame(width: 42, height: 42)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(primaryTextColor)
+                Text(subtitle)
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundStyle(secondaryTextColor)
+                    .lineLimit(1)
+                Text(badgeText)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(tint)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(tint.opacity(isTransparent ? 0.20 : 0.14))
+                    .clipShape(Capsule())
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func hudIconButton(systemName: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(primaryTextColor)
+                .frame(width: 18, height: 18)
+                .background(buttonChipFill)
+                .clipShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
     @ViewBuilder
     private var hudBackground: some View {
         if isTransparent {
-            Color.black.opacity(isHovered ? 0.22 : 0.08)
+            Color.black.opacity(isHovered ? 0.28 : 0.14)
         } else {
             Rectangle().fill(.ultraThinMaterial)
+        }
+    }
+
+    private var borderGradient: LinearGradient {
+        if isTransparent {
+            return LinearGradient(
+                colors: [Color.white.opacity(isHovered ? 0.40 : 0.28), Color.white.opacity(0.08)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        } else {
+            return LinearGradient(
+                colors: [Color.primary.opacity(0.20), Color.primary.opacity(0.08)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
         }
     }
 
@@ -200,28 +365,26 @@ struct FloatingMonitorView: View {
     }
 
     private var secondaryTextColor: Color {
-        isTransparent ? .white.opacity(0.78) : .secondary
+        isTransparent ? .white.opacity(0.76) : .secondary
     }
 
-    private func miniProgressBar(fraction: Double, tint: Color) -> some View {
-        GeometryReader { geo in
-            let clamped = min(1.0, max(0.0, fraction))
-            ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(isTransparent ? Color.white.opacity(0.18) : Color.primary.opacity(0.12))
-                Capsule()
-                    .fill(tint.opacity(0.92))
-                    .frame(width: max(3, geo.size.width * clamped))
-                    .animation(.easeInOut(duration: 0.25), value: clamped)
-            }
-        }
-        .frame(height: 5)
+    private var trackColor: Color {
+        isTransparent ? Color.white.opacity(0.16) : Color.primary.opacity(0.12)
+    }
+
+    private var dividerColor: Color {
+        isTransparent ? Color.white.opacity(0.16) : Color.primary.opacity(0.10)
+    }
+
+    private var buttonChipFill: Color {
+        isTransparent ? Color.white.opacity(0.18) : Color.primary.opacity(0.09)
     }
 }
 
 @MainActor
 final class FloatingMonitorController: ObservableObject {
     private var panel: FloatingHUDPanel?
+    private weak var hostingView: NSHostingView<FloatingMonitorView>?
     private weak var mainWindow: NSWindow?
     private var observers: [NSObjectProtocol] = []
     private var hasPositionedOnce = false
@@ -267,11 +430,37 @@ final class FloatingMonitorController: ObservableObject {
             if !hasPositionedOnce {
                 positionTopRight(panel)
                 hasPositionedOnce = true
+            } else {
+                updatePanelSize(viewModel: viewModel)
             }
             panel.orderFrontRegardless()
         } else {
             panel?.orderOut(nil)
         }
+    }
+
+    func updatePanelSize(viewModel: AppViewModel) {
+        guard let panel, let hostingView else { return }
+        hostingView.layoutSubtreeIfNeeded()
+        let newSize = hostingView.fittingSize
+        guard newSize.width > 0, newSize.height > 0 else { return }
+
+        let oldFrame = panel.frame
+        if abs(oldFrame.size.width - newSize.width) < 1 && abs(oldFrame.size.height - newSize.height) < 1 {
+            return
+        }
+
+        // Keep top-right corner (maxX, maxY) anchored when collapsing/expanding
+        var newX = oldFrame.maxX - newSize.width
+        var newY = oldFrame.maxY - newSize.height
+
+        if let screen = panel.screen ?? mainWindow?.screen ?? NSScreen.main ?? NSScreen.screens.first {
+            let visible = screen.visibleFrame
+            newX = min(max(visible.minX + 8, newX), visible.maxX - newSize.width - 8)
+            newY = min(max(visible.minY + 8, newY), visible.maxY - newSize.height - 8)
+        }
+
+        panel.setFrame(NSRect(origin: NSPoint(x: newX, y: newY), size: newSize), display: true)
     }
 
     func restoreMainWindow() {
@@ -287,6 +476,7 @@ final class FloatingMonitorController: ObservableObject {
         panel?.orderOut(nil)
         panel?.close()
         panel = nil
+        hostingView = nil
         detachObservers()
     }
 
@@ -294,18 +484,20 @@ final class FloatingMonitorController: ObservableObject {
         if let panel {
             return panel
         }
-        let initialRect = NSRect(x: 0, y: 0, width: 236, height: 96)
+        let initialRect = NSRect(x: 0, y: 0, width: 254, height: 142)
         let newPanel = FloatingHUDPanel(contentRect: initialRect)
-        let hostingView = NSHostingView(
+        let newHostingView = NSHostingView(
             rootView: FloatingMonitorView(viewModel: viewModel) { [weak self] in
                 self?.restoreMainWindow()
             }
         )
-        hostingView.wantsLayer = true
-        hostingView.layer?.backgroundColor = NSColor.clear.cgColor
-        newPanel.contentView = hostingView
-        newPanel.setContentSize(hostingView.fittingSize)
+        newHostingView.wantsLayer = true
+        newHostingView.layer?.backgroundColor = NSColor.clear.cgColor
+        newPanel.contentView = newHostingView
+        newHostingView.layoutSubtreeIfNeeded()
+        newPanel.setContentSize(newHostingView.fittingSize)
         self.panel = newPanel
+        self.hostingView = newHostingView
         return newPanel
     }
 
@@ -313,7 +505,7 @@ final class FloatingMonitorController: ObservableObject {
         guard let screen = mainWindow?.screen ?? NSScreen.main ?? NSScreen.screens.first else { return }
         let visible = screen.visibleFrame
         let size = panel.frame.size
-        let x = visible.maxX - size.width - 14
+        let x = visible.maxX - size.width - 16
         let y = visible.maxY - size.height - 12
         panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
