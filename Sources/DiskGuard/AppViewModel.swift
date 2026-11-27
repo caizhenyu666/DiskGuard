@@ -184,13 +184,13 @@ public final class AppViewModel: ObservableObject {
     }
     @Published public var showMenuBarExtra: Bool = true {
         didSet {
-            guard !isInitializing else { return }
+            guard !isInitializing, showMenuBarExtra != oldValue else { return }
             preferences.showMenuBarExtra = showMenuBarExtra
         }
     }
     @Published public var showMenuBarMetrics: Bool = true {
         didSet {
-            guard !isInitializing else { return }
+            guard !isInitializing, showMenuBarMetrics != oldValue else { return }
             preferences.showMenuBarMetrics = showMenuBarMetrics
         }
     }

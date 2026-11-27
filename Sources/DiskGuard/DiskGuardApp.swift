@@ -29,8 +29,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct DiskGuardApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var viewModel = AppViewModel()
-    @StateObject private var floatingController = FloatingMonitorController()
+    private let viewModel = AppViewModel()
+    private let floatingController = FloatingMonitorController()
+    @AppStorage("diskguard.showMenuBarExtra") private var showMenuBarExtra: Bool = true
+    @AppStorage("diskguard.appearanceMode") private var appearanceModeRaw: String = AppearanceMode.system.rawValue
 
     var body: some Scene {
         WindowGroup("DiskGuard", id: "main") {
@@ -41,7 +43,7 @@ struct DiskGuardApp: App {
         .defaultSize(width: 1060, height: 760)
         .windowStyle(.hiddenTitleBar)
 
-        MenuBarExtra(isInserted: $viewModel.showMenuBarExtra) {
+        MenuBarExtra(isInserted: menuBarInsertedBinding) {
             MenuBarPopoverView(viewModel: viewModel, floatingController: floatingController)
                 .preferredColorScheme(preferredScheme)
         } label: {
@@ -50,8 +52,21 @@ struct DiskGuardApp: App {
         .menuBarExtraStyle(.window)
     }
 
+    private var menuBarInsertedBinding: Binding<Bool> {
+        Binding(
+            get: { showMenuBarExtra },
+            set: { newValue in
+                guard newValue != showMenuBarExtra else { return }
+                showMenuBarExtra = newValue
+                if viewModel.showMenuBarExtra != newValue {
+                    viewModel.showMenuBarExtra = newValue
+                }
+            }
+        )
+    }
+
     private var preferredScheme: ColorScheme? {
-        switch viewModel.appearanceMode {
+        switch AppearanceMode(rawValue: appearanceModeRaw) ?? .system {
         case .system: return nil
         case .light: return .light
         case .dark: return .dark

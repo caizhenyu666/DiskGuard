@@ -577,10 +577,20 @@ final class FloatingMonitorController: ObservableObject {
 struct MainWindowAccessor: NSViewRepresentable {
     let onWindow: @MainActor (NSWindow) -> Void
 
+    final class Coordinator {
+        weak var attachedWindow: NSWindow?
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeNSView(context: Context) -> NSView {
         let view = NSView(frame: .zero)
+        let coordinator = context.coordinator
         DispatchQueue.main.async {
-            if let window = view.window {
+            if let window = view.window, window !== coordinator.attachedWindow {
+                coordinator.attachedWindow = window
                 onWindow(window)
             }
         }
@@ -588,8 +598,13 @@ struct MainWindowAccessor: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
+        let coordinator = context.coordinator
+        if let window = nsView.window, window === coordinator.attachedWindow {
+            return
+        }
         DispatchQueue.main.async {
-            if let window = nsView.window {
+            if let window = nsView.window, window !== coordinator.attachedWindow {
+                coordinator.attachedWindow = window
                 onWindow(window)
             }
         }
