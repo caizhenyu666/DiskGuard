@@ -16,6 +16,23 @@ struct SystemHealthView: View {
         }
     }
 
+    private var vpn: VPNStatus { health.vpn }
+
+    private var vpnColor: Color {
+        switch vpn.kind {
+        case .systemVPN: return .green
+        case .tunTunnel: return .teal
+        case .systemProxy: return .blue
+        case .direct: return .secondary
+        }
+    }
+
+    private var vpnIconName: String {
+        if vpn.isVPNActive { return "lock.shield.fill" }
+        if vpn.proxy.isEnabled { return "network.badge.shield.half.filled" }
+        return "globe"
+    }
+
     var body: some View {
         ScrollView {
             VStack(spacing: 14) {
@@ -25,9 +42,11 @@ struct SystemHealthView: View {
                 }
 
                 HStack(alignment: .top, spacing: 14) {
+                    vpnAndProxyCard
                     hardwareAndBatteryCard
-                    maintenanceAdvisorCard
                 }
+
+                maintenanceAdvisorCard
             }
             .padding(24)
         }
@@ -134,6 +153,69 @@ struct SystemHealthView: View {
                     .font(.system(size: 11).monospacedDigit())
                     .foregroundStyle(.secondary)
                 Spacer()
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    // MARK: - VPN & Proxy
+
+    private var vpnAndProxyCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: vpnIconName)
+                    .foregroundStyle(vpnColor)
+                Text("VPN 与网络代理")
+                    .font(.system(size: 14, weight: .semibold))
+                Spacer()
+                Text(vpn.displayStatusText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(vpnColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2)
+                    .background(vpnColor.opacity(0.14))
+                    .clipShape(Capsule())
+            }
+
+            Divider()
+
+            if vpn.isVPNActive {
+                let serviceLabel: String = {
+                    if let name = vpn.serviceName, let iface = vpn.interfaceName {
+                        return "\(name) (\(iface))"
+                    }
+                    return vpn.serviceName ?? vpn.interfaceName ?? "VPN 隧道"
+                }()
+                metricRow(label: "隧道 / 服务", value: serviceLabel)
+                metricRow(label: "虚拟 IP", value: vpn.virtualIP ?? "已分配")
+            }
+
+            metricRow(label: "系统代理", value: vpn.proxy.summary ?? "未开启")
+
+            let outletLabel: String = {
+                switch (vpn.primaryInterface, vpn.localIP) {
+                case (let iface?, let ip?): return "\(iface) · \(ip)"
+                case (nil, let ip?): return ip
+                case (let iface?, nil): return iface
+                case (nil, nil): return "检测中"
+                }
+            }()
+            metricRow(label: "当前物理出口", value: outletLabel)
+
+            HStack {
+                Spacer()
+                Button("打开网络 / VPN 设置") {
+                    viewModel.openNetworkSettings()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
         }
         .padding(14)

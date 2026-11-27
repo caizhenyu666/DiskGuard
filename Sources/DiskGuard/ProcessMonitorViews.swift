@@ -82,7 +82,6 @@ struct MemoryTabView: View {
                     .trim(from: 0, to: memory.usedRatio)
                     .stroke(pressureColor, style: StrokeStyle(lineWidth: 8, lineCap: .round))
                     .rotationEffect(.degrees(-90))
-                    .animation(.easeOut(duration: 0.25), value: memory.usedRatio)
 
                 VStack(spacing: 1) {
                     Text("\(Int((memory.usedRatio * 100).rounded()))%")
@@ -136,7 +135,6 @@ struct MemoryTabView: View {
                             }
                         }
                         .clipShape(Capsule())
-                        .animation(.easeOut(duration: 0.25), value: memory.usedBytes)
                     }
                 }
                 .frame(height: 10)
@@ -218,7 +216,6 @@ struct CPUTabView: View {
                     .trim(from: 0, to: cpu.totalUsage)
                     .stroke(cpuAccent, style: StrokeStyle(lineWidth: 8, lineCap: .round))
                     .rotationEffect(.degrees(-90))
-                    .animation(.easeOut(duration: 0.25), value: cpu.totalUsage)
 
                 VStack(spacing: 1) {
                     Text(String(format: "%.0f%%", cpu.totalUsage * 100))
@@ -294,7 +291,10 @@ struct ProcessGroupListView: View {
     let metric: ProcessSortMetric
 
     @State private var expandedGroupIDs: Set<String> = []
-    @State private var hoveredID: String?
+    @State private var isManuallyPaused = false
+    @State private var pausedGroups: [ProcessGroup] = []
+    @State private var isHoveringList = false
+    @State private var frozenOrderIDs: [String] = []
 
     private var groups: [ProcessGroup] {
         switch metric {
@@ -303,28 +303,60 @@ struct ProcessGroupListView: View {
         }
     }
 
+    private var displayedGroups: [ProcessGroup] {
+        if isManuallyPaused {
+            return pausedGroups
+        }
+        let liveGroups = groups
+        guard isHoveringList, !frozenOrderIDs.isEmpty else {
+            return liveGroups
+        }
+        var byID: [String: ProcessGroup] = [:]
+        byID.reserveCapacity(liveGroups.count)
+        for group in liveGroups {
+            byID[group.id] = group
+        }
+        var ordered: [ProcessGroup] = []
+        ordered.reserveCapacity(liveGroups.count)
+        var seen: Set<String> = []
+        seen.reserveCapacity(frozenOrderIDs.count)
+        for id in frozenOrderIDs {
+            if let updated = byID[id] {
+                ordered.append(updated)
+                seen.insert(id)
+            }
+        }
+        for group in liveGroups where !seen.contains(group.id) {
+            ordered.append(group)
+        }
+        return ordered
+    }
+
     private var totalProcessCount: Int {
-        groups.reduce(0) { $0 + $1.processCount }
+        displayedGroups.reduce(0) { $0 + $1.processCount }
     }
 
     private var maxGroupValue: Double {
         switch metric {
         case .memory:
-            return max(1, Double(groups.map(\.totalFootprintBytes).max() ?? 1))
+            return max(1, Double(displayedGroups.map(\.totalFootprintBytes).max() ?? 1))
         case .cpu:
-            return max(1, groups.map(\.totalCPUPercent).max() ?? 1)
+            return max(1, displayedGroups.map(\.totalCPUPercent).max() ?? 1)
         }
     }
 
     var body: some View {
+        let rows = displayedGroups
+        let maxValue = maxGroupValue
+
         VStack(spacing: 0) {
-            filterToolbar
+            filterToolbar(rows: rows)
                 .padding(.horizontal, 24)
                 .padding(.vertical, 10)
 
             Divider()
 
-            if groups.isEmpty {
+            if rows.isEmpty {
                 VStack(spacing: 10) {
                     Image(systemName: "waveform.path.ecg")
                         .font(.system(size: 30))
@@ -337,27 +369,65 @@ struct ProcessGroupListView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(groups) { group in
-                            groupRow(group)
+                        ForEach(rows) { group in
+                            let isExpanded = expandedGroupIDs.contains(group.id)
+                            ProcessGroupRowView(
+                                group: group,
+                                metric: metric,
+                                maxGroupValue: maxValue,
+                                isExpanded: isExpanded,
+                                onToggleExpand: {
+                                    withAnimation(.easeInOut(duration: 0.15)) {
+                                        if expandedGroupIDs.contains(group.id) {
+                                            expandedGroupIDs.remove(group.id)
+                                        } else {
+                                            expandedGroupIDs.insert(group.id)
+                                        }
+                                    }
+                                },
+                                onTerminate: { mode in
+                                    viewModel.terminateGroup(group, mode: mode)
+                                }
+                            )
 
-                            if expandedGroupIDs.contains(group.id) && group.processCount > 1 {
+                            if isExpanded && group.processCount > 1 {
                                 ForEach(group.processes) { proc in
                                     childProcessRow(proc, parentGroup: group)
                                 }
                             }
 
-                            if group.id != groups.last?.id {
+                            if group.id != rows.last?.id {
                                 Divider().padding(.leading, 56)
                             }
                         }
                     }
                     .padding(.vertical, 4)
                 }
+                .onHover { hovering in
+                    isHoveringList = hovering
+                    if hovering {
+                        frozenOrderIDs = displayedGroups.map(\.id)
+                    } else {
+                        frozenOrderIDs = []
+                    }
+                }
+            }
+        }
+        .onChange(of: viewModel.processSearchText) { _, _ in
+            frozenOrderIDs = []
+            if isManuallyPaused {
+                pausedGroups = groups
+            }
+        }
+        .onChange(of: viewModel.onlyClosableProcesses) { _, _ in
+            frozenOrderIDs = []
+            if isManuallyPaused {
+                pausedGroups = groups
             }
         }
     }
 
-    private var filterToolbar: some View {
+    private func filterToolbar(rows: [ProcessGroup]) -> some View {
         HStack(spacing: 10) {
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
@@ -392,12 +462,51 @@ struct ProcessGroupListView: View {
 
             Spacer()
 
-            Text("共 \(groups.count) 个应用组 · \(totalProcessCount) 个进程（按\(metric == .memory ? "内存" : "CPU")降序）")
+            if isManuallyPaused {
+                Text("已暂停")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.14))
+                    .clipShape(Capsule())
+            } else if isHoveringList {
+                Text("排序已锁定")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Color.primary.opacity(0.07))
+                    .clipShape(Capsule())
+            }
+
+            Text("共 \(rows.count) 个应用组 · \(totalProcessCount) 个进程（按\(metric == .memory ? "内存" : "CPU")降序）")
                 .font(.system(size: 11.5).monospacedDigit())
                 .foregroundStyle(.secondary)
 
             Button {
-                Task { await viewModel.sampleSystemNow(includeProcesses: true) }
+                if isManuallyPaused {
+                    isManuallyPaused = false
+                    pausedGroups = []
+                } else {
+                    pausedGroups = rows
+                    isManuallyPaused = true
+                }
+            } label: {
+                Label(isManuallyPaused ? "继续" : "暂停", systemImage: isManuallyPaused ? "play.fill" : "pause.fill")
+            }
+            .buttonStyle(.bordered)
+            .tint(isManuallyPaused ? .orange : nil)
+            .controlSize(.small)
+            .help(isManuallyPaused ? "恢复实时刷新" : "暂停刷新，防止列表位置跳动")
+
+            Button {
+                Task {
+                    await viewModel.sampleSystemNow(includeProcesses: true)
+                    if isManuallyPaused {
+                        pausedGroups = groups
+                    }
+                }
             } label: {
                 Label("刷新", systemImage: "arrow.clockwise")
             }
@@ -406,27 +515,91 @@ struct ProcessGroupListView: View {
         }
     }
 
-    private func groupRow(_ group: ProcessGroup) -> some View {
-        let isExpanded = expandedGroupIDs.contains(group.id)
-        let isHovered = hoveredID == group.id
-        let ratio: Double = {
-            switch metric {
-            case .memory: return Double(group.totalFootprintBytes) / maxGroupValue
-            case .cpu: return group.totalCPUPercent / maxGroupValue
-            }
-        }()
+    private func childProcessRow(_ proc: ProcessEntry, parentGroup: ProcessGroup) -> some View {
+        HStack(spacing: 10) {
+            Spacer().frame(width: 34)
 
-        return HStack(spacing: 10) {
-            if group.processCount > 1 {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.15)) {
-                        if isExpanded {
-                            expandedGroupIDs.remove(group.id)
-                        } else {
-                            expandedGroupIDs.insert(group.id)
-                        }
-                    }
+            Circle()
+                .fill(Color.secondary.opacity(0.45))
+                .frame(width: 5, height: 5)
+
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6) {
+                    Text(proc.name)
+                        .font(.system(size: 12))
+                        .lineLimit(1)
+
+                    Text("PID \(proc.pid)")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+
+                if parentGroup.appBundlePath == nil && !proc.executablePath.isEmpty {
+                    Text(DiskByteFormatter.compactPath(URL(fileURLWithPath: proc.executablePath)))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+
+            Spacer()
+
+            if !proc.isProtected && !parentGroup.isProtected {
+                Button("结束") {
+                    viewModel.terminateProcess(proc, mode: .graceful)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+
+                Button(role: .destructive) {
+                    viewModel.terminateProcess(proc, mode: .force)
                 } label: {
+                    Image(systemName: "xmark.octagon")
+                        .font(.system(size: 10))
+                }
+                .buttonStyle(.bordered)
+                .tint(.red)
+                .controlSize(.mini)
+                .help("强制结束此子进程")
+            }
+
+            HStack(spacing: 10) {
+                Text(MemoryByteFormatter.string(from: proc.footprintBytes))
+                Text(String(format: "%.1f%%", proc.cpuPercent))
+                    .frame(width: 48, alignment: .trailing)
+            }
+            .font(.system(size: 11).monospacedDigit())
+            .foregroundStyle(.secondary)
+            .frame(width: 140, alignment: .trailing)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 5)
+        .background(Color.primary.opacity(0.02))
+    }
+}
+
+private struct ProcessGroupRowView: View {
+    let group: ProcessGroup
+    let metric: ProcessSortMetric
+    let maxGroupValue: Double
+    let isExpanded: Bool
+    let onToggleExpand: () -> Void
+    let onTerminate: (ProcessController.TerminateMode) -> Void
+
+    @State private var isHovered = false
+
+    private var ratio: Double {
+        switch metric {
+        case .memory: return Double(group.totalFootprintBytes) / maxGroupValue
+        case .cpu: return group.totalCPUPercent / maxGroupValue
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if group.processCount > 1 {
+                Button(action: onToggleExpand) {
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(.secondary)
@@ -492,7 +665,7 @@ struct ProcessGroupListView: View {
             if !group.isProtected {
                 HStack(spacing: 5) {
                     Button {
-                        viewModel.terminateGroup(group, mode: .graceful)
+                        onTerminate(.graceful)
                     } label: {
                         Text(group.processCount > 1 ? "全部退出" : "退出")
                             .font(.system(size: 11, weight: .medium))
@@ -502,7 +675,7 @@ struct ProcessGroupListView: View {
                     .help(group.processCount > 1 ? "向该应用的全部 \(group.processCount) 个进程发送退出请求" : "优雅退出该进程")
 
                     Button(role: .destructive) {
-                        viewModel.terminateGroup(group, mode: .force)
+                        onTerminate(.force)
                     } label: {
                         Image(systemName: "xmark.octagon")
                             .font(.system(size: 11))
@@ -544,69 +717,12 @@ struct ProcessGroupListView: View {
         .background(isHovered ? Color.primary.opacity(0.03) : Color.clear)
         .contentShape(Rectangle())
         .onHover { hovering in
-            hoveredID = hovering ? group.id : (hoveredID == group.id ? nil : hoveredID)
+            isHovered = hovering
         }
         .onTapGesture {
             if group.processCount > 1 {
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    if isExpanded {
-                        expandedGroupIDs.remove(group.id)
-                    } else {
-                        expandedGroupIDs.insert(group.id)
-                    }
-                }
+                onToggleExpand()
             }
         }
-    }
-
-    private func childProcessRow(_ proc: ProcessEntry, parentGroup: ProcessGroup) -> some View {
-        HStack(spacing: 10) {
-            Spacer().frame(width: 34)
-
-            Circle()
-                .fill(Color.secondary.opacity(0.45))
-                .frame(width: 5, height: 5)
-
-            Text(proc.name)
-                .font(.system(size: 12))
-                .lineLimit(1)
-
-            Text("PID \(proc.pid)")
-                .font(.system(size: 10.5, design: .monospaced))
-                .foregroundStyle(.secondary)
-
-            Spacer()
-
-            if !proc.isProtected && !parentGroup.isProtected {
-                Button("结束") {
-                    viewModel.terminateProcess(proc, mode: .graceful)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
-
-                Button(role: .destructive) {
-                    viewModel.terminateProcess(proc, mode: .force)
-                } label: {
-                    Image(systemName: "xmark.octagon")
-                        .font(.system(size: 10))
-                }
-                .buttonStyle(.bordered)
-                .tint(.red)
-                .controlSize(.mini)
-                .help("强制结束此子进程")
-            }
-
-            HStack(spacing: 10) {
-                Text(MemoryByteFormatter.string(from: proc.footprintBytes))
-                Text(String(format: "%.1f%%", proc.cpuPercent))
-                    .frame(width: 48, alignment: .trailing)
-            }
-            .font(.system(size: 11).monospacedDigit())
-            .foregroundStyle(.secondary)
-            .frame(width: 140, alignment: .trailing)
-        }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 5)
-        .background(Color.primary.opacity(0.02))
     }
 }

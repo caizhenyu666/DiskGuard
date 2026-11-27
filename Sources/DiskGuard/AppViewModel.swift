@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import AppKit
+import ServiceManagement
 import DiskGuardCore
 
 public enum FilterTab: String, CaseIterable, Identifiable {
@@ -41,14 +42,35 @@ public enum UpdateState: Equatable {
 
 public enum PendingProcessAction: Identifiable {
     case forceGroup(ProcessGroup)
+    case gracefulCLIGroup(ProcessGroup)
     case forceProcess(ProcessEntry)
 
     public var id: String {
         switch self {
         case .forceGroup(let group):
-            return "group.\(group.id)"
+            return "group.force.\(group.id)"
+        case .gracefulCLIGroup(let group):
+            return "group.graceful.\(group.id)"
         case .forceProcess(let proc):
             return "proc.\(proc.pid)"
+        }
+    }
+
+    public var confirmButtonTitle: String {
+        switch self {
+        case .forceGroup, .forceProcess:
+            return "强制结束"
+        case .gracefulCLIGroup:
+            return "确认全部退出"
+        }
+    }
+
+    public var isDestructive: Bool {
+        switch self {
+        case .forceGroup, .forceProcess:
+            return true
+        case .gracefulCLIGroup:
+            return false
         }
     }
 
@@ -58,6 +80,8 @@ public enum PendingProcessAction: Identifiable {
             return group.processCount > 1
                 ? "强制结束「\(group.displayName)」全部 \(group.processCount) 个进程？"
                 : "强制结束「\(group.displayName)」？"
+        case .gracefulCLIGroup(let group):
+            return "退出全部 \(group.processCount) 个「\(group.displayName)」命令行进程？"
         case .forceProcess(let proc):
             return "强制结束进程「\(proc.name)」(PID \(proc.pid))？"
         }
@@ -67,10 +91,19 @@ public enum PendingProcessAction: Identifiable {
         switch self {
         case .forceGroup(let group):
             return "将向「\(group.displayName)」的 \(group.processCount) 个进程发送强制终止信号（SIGKILL），未保存的更改可能会丢失。"
+        case .gracefulCLIGroup(let group):
+            return "「\(group.displayName)」是命令行进程组，可能包含终端、编辑器或其他后台服务正在使用的实例。点击「确认全部退出」将向全部 \(group.processCount) 个进程发送退出信号（SIGTERM）；如只需关闭单个实例，建议取消后展开子进程逐个结束。"
         case .forceProcess(let proc):
             return "将向进程 \(proc.name)（PID \(proc.pid)）发送强制终止信号（SIGKILL），未保存的更改可能会丢失。"
         }
     }
+}
+
+public struct MonitorTelemetry: Sendable, Equatable {
+    public var snapshot: SystemSnapshot
+    public var cpuHistory: [Double] = []
+    public var memoryHistory: [Double] = []
+    public var networkDownHistory: [Double] = []
 }
 
 @MainActor
@@ -115,10 +148,11 @@ public final class AppViewModel: ObservableObject {
             preferences.activeMainSectionRawValue = activeSection.rawValue
         }
     }
-    @Published public var systemSnapshot: SystemSnapshot
-    @Published public var cpuHistory: [Double] = []
-    @Published public var memoryHistory: [Double] = []
-    @Published public var networkDownHistory: [Double] = []
+    @Published public var telemetry: MonitorTelemetry
+    public var systemSnapshot: SystemSnapshot { telemetry.snapshot }
+    public var cpuHistory: [Double] { telemetry.cpuHistory }
+    public var memoryHistory: [Double] { telemetry.memoryHistory }
+    public var networkDownHistory: [Double] { telemetry.networkDownHistory }
     @Published public var processSearchText: String = ""
     @Published public var onlyClosableProcesses: Bool = false
     @Published public var pendingProcessTermination: PendingProcessAction?
@@ -148,6 +182,19 @@ public final class AppViewModel: ObservableObject {
             preferences.floatingHUDCollapsed = floatingHUDCollapsed
         }
     }
+    @Published public var showMenuBarExtra: Bool = true {
+        didSet {
+            guard !isInitializing else { return }
+            preferences.showMenuBarExtra = showMenuBarExtra
+        }
+    }
+    @Published public var showMenuBarMetrics: Bool = true {
+        didSet {
+            guard !isInitializing else { return }
+            preferences.showMenuBarMetrics = showMenuBarMetrics
+        }
+    }
+    @Published public var launchAtLogin: Bool = false
     @Published public var collapsedTiers: Set<RiskTier> = [] {
         didSet {
             guard !isInitializing else { return }
@@ -174,7 +221,7 @@ public final class AppViewModel: ObservableObject {
     public init(preferences: UserPreferences = UserPreferences()) {
         let sampler = SystemMonitorSampler()
         self.systemSampler = sampler
-        self.systemSnapshot = sampler.sample(includeTopProcesses: false)
+        self.telemetry = MonitorTelemetry(snapshot: sampler.sample(includeTopProcesses: false))
         self.preferences = preferences
         self.appearanceMode = preferences.appearanceMode
         self.collapsedTiers = preferences.collapsedTiers
@@ -184,6 +231,9 @@ public final class AppViewModel: ObservableObject {
         self.floatingHUDAlwaysOn = preferences.floatingHUDAlwaysOn
         self.floatingHUDStyle = preferences.floatingHUDStyle
         self.floatingHUDCollapsed = preferences.floatingHUDCollapsed
+        self.showMenuBarExtra = preferences.showMenuBarExtra
+        self.showMenuBarMetrics = preferences.showMenuBarMetrics
+        self.launchAtLogin = (SMAppService.mainApp.status == .enabled)
         self.activeSection = MainSectionTab(rawValue: preferences.activeMainSectionRawValue) ?? .storage
         self.isInitializing = false
         applyAppAppearance()
@@ -635,6 +685,31 @@ public final class AppViewModel: ObservableObject {
         }
     }
 
+    public func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            launchAtLogin = (SMAppService.mainApp.status == .enabled)
+            appendLog(level: .info, message: launchAtLogin ? "已开启登录时自动启动。" : "已关闭登录时自动启动。")
+        } catch {
+            launchAtLogin = (SMAppService.mainApp.status == .enabled)
+            appendLog(
+                level: .warning,
+                message: "无法修改登录自启设置（请确认 DiskGuard.app 位于 /Applications 目录并已正确打包）：\(error.localizedDescription)"
+            )
+            isLogDrawerExpanded = true
+        }
+    }
+
+    public func openNetworkSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.Network-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     public var memoryProcessGroups: [ProcessGroup] {
         filteredProcessGroups(sortedBy: .memory)
     }
@@ -644,9 +719,22 @@ public final class AppViewModel: ObservableObject {
     }
 
     private func filteredProcessGroups(sortedBy metric: ProcessSortMetric) -> [ProcessGroup] {
-        let grouped = SystemMonitorSampler.groupProcesses(systemSnapshot.processes, sortBy: metric)
+        let pregrouped: [ProcessGroup]
+        switch metric {
+        case .memory:
+            pregrouped = systemSnapshot.memoryGroups.isEmpty && !systemSnapshot.processes.isEmpty
+                ? SystemMonitorSampler.groupProcesses(systemSnapshot.processes, sortBy: .memory)
+                : systemSnapshot.memoryGroups
+        case .cpu:
+            pregrouped = systemSnapshot.cpuGroups.isEmpty && !systemSnapshot.processes.isEmpty
+                ? SystemMonitorSampler.groupProcesses(systemSnapshot.processes, sortBy: .cpu)
+                : systemSnapshot.cpuGroups
+        }
         let query = processSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return grouped.filter { group in
+        guard onlyClosableProcesses || !query.isEmpty else {
+            return pregrouped
+        }
+        return pregrouped.filter { group in
             if onlyClosableProcesses && group.isProtected {
                 return false
             }
@@ -663,6 +751,10 @@ public final class AppViewModel: ObservableObject {
     public func terminateGroup(_ group: ProcessGroup, mode: ProcessController.TerminateMode) {
         if mode == .force {
             pendingProcessTermination = .forceGroup(group)
+            return
+        }
+        if group.appBundlePath == nil && group.processCount > 1 {
+            pendingProcessTermination = .gracefulCLIGroup(group)
             return
         }
         executeTerminateGroup(group, mode: mode)
@@ -686,6 +778,8 @@ public final class AppViewModel: ObservableObject {
         switch action {
         case .forceGroup(let group):
             executeTerminateGroup(group, mode: .force)
+        case .gracefulCLIGroup(let group):
+            executeTerminateGroup(group, mode: .graceful)
         case .forceProcess(let proc):
             executeTerminateProcess(proc, mode: .force)
         }
@@ -757,7 +851,7 @@ public final class AppViewModel: ObservableObject {
                 }
 
                 tickCount &+= 1
-                try? await Task.sleep(for: .milliseconds(1500))
+                try? await Task.sleep(for: .milliseconds(2000))
             }
         }
     }
@@ -769,18 +863,27 @@ public final class AppViewModel: ObservableObject {
         }
         if Task.isCancelled { return }
 
+        let current = self.telemetry
         let mergedSnapshot = SystemSnapshot(
             timestamp: sampled.timestamp,
             memory: sampled.memory,
             cpu: sampled.cpu,
-            topProcesses: includeProcesses ? sampled.topProcesses : self.systemSnapshot.topProcesses,
-            processes: includeProcesses ? sampled.processes : self.systemSnapshot.processes,
+            topProcesses: includeProcesses ? sampled.topProcesses : current.snapshot.topProcesses,
+            processes: includeProcesses ? sampled.processes : current.snapshot.processes,
+            memoryGroups: includeProcesses ? sampled.memoryGroups : current.snapshot.memoryGroups,
+            cpuGroups: includeProcesses ? sampled.cpuGroups : current.snapshot.cpuGroups,
             health: sampled.health
         )
-        self.systemSnapshot = mergedSnapshot
-        self.appendMonitorSample(mergedSnapshot.cpu.totalUsage, to: &self.cpuHistory)
-        self.appendMonitorSample(mergedSnapshot.memory.usedRatio, to: &self.memoryHistory)
-        self.appendMonitorSample(mergedSnapshot.health.network.downloadBytesPerSec, to: &self.networkDownHistory)
+        var next = MonitorTelemetry(
+            snapshot: mergedSnapshot,
+            cpuHistory: current.cpuHistory,
+            memoryHistory: current.memoryHistory,
+            networkDownHistory: current.networkDownHistory
+        )
+        self.appendMonitorSample(mergedSnapshot.cpu.totalUsage, to: &next.cpuHistory)
+        self.appendMonitorSample(mergedSnapshot.memory.usedRatio, to: &next.memoryHistory)
+        self.appendMonitorSample(mergedSnapshot.health.network.downloadBytesPerSec, to: &next.networkDownHistory)
+        self.telemetry = next
     }
 
     public func stopSystemMonitoring() {

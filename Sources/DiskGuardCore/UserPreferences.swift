@@ -17,6 +17,8 @@ public struct UserPreferences: Sendable {
         static let floatingHUDStyle = "diskguard.floatingHUDStyle"
         static let floatingHUDCollapsed = "diskguard.floatingHUDCollapsed"
         static let activeMainSection = "diskguard.activeMainSection"
+        static let showMenuBarExtra = "diskguard.showMenuBarExtra"
+        static let showMenuBarMetrics = "diskguard.showMenuBarMetrics"
     }
 
     private var defaults: UserDefaults {
@@ -118,6 +120,30 @@ public struct UserPreferences: Sendable {
         }
         nonmutating set {
             defaults.set(newValue, forKey: Keys.activeMainSection)
+        }
+    }
+
+    public var showMenuBarExtra: Bool {
+        get {
+            if defaults.object(forKey: Keys.showMenuBarExtra) == nil {
+                return true
+            }
+            return defaults.bool(forKey: Keys.showMenuBarExtra)
+        }
+        nonmutating set {
+            defaults.set(newValue, forKey: Keys.showMenuBarExtra)
+        }
+    }
+
+    public var showMenuBarMetrics: Bool {
+        get {
+            if defaults.object(forKey: Keys.showMenuBarMetrics) == nil {
+                return true
+            }
+            return defaults.bool(forKey: Keys.showMenuBarMetrics)
+        }
+        nonmutating set {
+            defaults.set(newValue, forKey: Keys.showMenuBarMetrics)
         }
     }
 }

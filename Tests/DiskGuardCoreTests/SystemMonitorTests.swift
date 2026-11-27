@@ -86,13 +86,19 @@ struct SystemMonitorTests {
 
         #expect(reloaded.activeMainSectionRawValue == "storage")
         #expect(reloaded.floatingHUDCollapsed == false)
+        #expect(reloaded.showMenuBarExtra == true)
+        #expect(reloaded.showMenuBarMetrics == true)
 
         reloaded.activeMainSectionRawValue = "memory"
         reloaded.floatingHUDCollapsed = true
+        reloaded.showMenuBarExtra = false
+        reloaded.showMenuBarMetrics = false
 
         let secondReload = UserPreferences(suiteName: suite)
         #expect(secondReload.activeMainSectionRawValue == "memory")
         #expect(secondReload.floatingHUDCollapsed == true)
+        #expect(secondReload.showMenuBarExtra == false)
+        #expect(secondReload.showMenuBarMetrics == false)
     }
 
     @Test("outermostAppBundlePath extracts top-level .app for nested helper executables")
@@ -174,5 +180,120 @@ struct SystemMonitorTests {
         let reset = NetworkStats.compute(previousIn: 5000, previousOut: 5000, previousTime: 12.0, currentIn: 200, currentOut: 100, currentTime: 14.0)
         #expect(reset.downloadBytesPerSec == 0)
         #expect(reset.uploadBytesPerSec == 0)
+    }
+
+    @Test("SystemMonitorSampler enumerates full process table, caches PID metadata, and pre-groups sorted views")
+    func fullProcessEnumerationAndPregrouping() {
+        let sampler = SystemMonitorSampler()
+        let first = sampler.sample(includeTopProcesses: true, topLimit: 8)
+        #expect(first.processes.count > 50)
+        #expect(!first.memoryGroups.isEmpty)
+        #expect(first.memoryGroups.count == first.cpuGroups.count)
+
+        if first.memoryGroups.count >= 2 {
+            #expect(first.memoryGroups[0].totalFootprintBytes >= first.memoryGroups[1].totalFootprintBytes)
+        }
+
+        let second = sampler.sample(includeTopProcesses: true, topLimit: 8)
+        #expect(second.processes.count > 50)
+        #expect(!second.memoryGroups.isEmpty)
+        #expect(!second.cpuGroups.isEmpty)
+    }
+
+    @Test("Zero-allocation byte formatters produce clean binary memory and decimal file units")
+    func byteFormattersOutput() {
+        #expect(MemoryByteFormatter.string(from: 0) == "0 MB")
+        #expect(MemoryByteFormatter.string(from: 14 * 1_048_576) == "14 MB")
+        #expect(MemoryByteFormatter.string(from: 4 * 1_073_741_824) == "4 GB")
+        #expect(MemoryByteFormatter.string(from: 1_099_511_627_776) == "1 TB")
+        #expect(MemoryByteFormatter.string(from: UInt64((181.3 * 1_048_576.0).rounded())) == "181.3 MB")
+        #expect(MemoryByteFormatter.string(from: UInt64((13.24 * 1_073_741_824.0).rounded())) == "13.24 GB")
+
+        #expect(DiskByteFormatter.string(from: 0) == "Zero KB")
+        #expect(DiskByteFormatter.string(from: 512) == "512 bytes")
+        #expect(DiskByteFormatter.string(from: 2_000) == "2 KB")
+        #expect(DiskByteFormatter.string(from: 1_500_000) == "1.5 MB")
+        #expect(DiskByteFormatter.string(from: 2_500_000_000) == "2.5 GB")
+    }
+
+    @Test("parseProxySettings extracts HTTP, HTTPS, SOCKS, PAC, and disabled states")
+    func proxySettingsParsing() {
+        let disabled = SystemMonitorSampler.parseProxySettings([:])
+        #expect(disabled.isEnabled == false)
+        #expect(disabled.summary == nil)
+
+        let combined = SystemMonitorSampler.parseProxySettings([
+            "HTTPEnable": 1,
+            "HTTPProxy": "127.0.0.1",
+            "HTTPPort": 7890,
+            "HTTPSEnable": 1,
+            "HTTPSProxy": "127.0.0.1",
+            "HTTPSPort": 7890,
+            "SOCKSEnable": 1,
+            "SOCKSProxy": "127.0.0.1",
+            "SOCKSPort": 7891
+        ])
+        #expect(combined.isEnabled == true)
+        #expect(combined.httpEndpoint == "127.0.0.1:7890")
+        #expect(combined.httpsEndpoint == "127.0.0.1:7890")
+        #expect(combined.socksEndpoint == "127.0.0.1:7891")
+        #expect(combined.summary == "HTTPS 127.0.0.1:7890")
+
+        let pacOnly = SystemMonitorSampler.parseProxySettings([
+            "HTTPEnable": 0,
+            "ProxyAutoConfigEnable": 1,
+            "ProxyAutoConfigURLString": "http://127.0.0.1:9090/proxy.pac"
+        ])
+        #expect(pacOnly.isEnabled == true)
+        #expect(pacOnly.summary == "PAC http://127.0.0.1:9090/proxy.pac")
+    }
+
+    @Test("classifyVPNStatus prioritizes system VPN, TUN tunnel, ignores link-local utun, and detects proxy/direct")
+    func vpnClassification() {
+        let sysVPN = SystemMonitorSampler.classifyVPNStatus(
+            primaryInterface: "en0",
+            activeIPv4ByInterface: ["en0": "192.168.1.20", "utun5": "10.8.0.2"],
+            connectedSystemVPN: (serviceName: "Company WireGuard", interfaceName: "utun5", virtualIP: nil),
+            proxy: .disabled
+        )
+        #expect(sysVPN.kind == .systemVPN)
+        #expect(sysVPN.isVPNActive == true)
+        #expect(sysVPN.shortBadgeText == "VPN")
+        #expect(sysVPN.serviceName == "Company WireGuard")
+        #expect(sysVPN.virtualIP == "10.8.0.2")
+        #expect(sysVPN.localIP == "192.168.1.20")
+
+        let tunVPN = SystemMonitorSampler.classifyVPNStatus(
+            primaryInterface: "en0",
+            activeIPv4ByInterface: ["en0": "192.168.1.20", "utun4": "198.18.0.1"],
+            connectedSystemVPN: nil,
+            proxy: SystemProxyInfo(httpEndpoint: "127.0.0.1:7890", httpsEndpoint: nil, socksEndpoint: nil, pacURL: nil)
+        )
+        #expect(tunVPN.kind == .tunTunnel)
+        #expect(tunVPN.isVPNActive == true)
+        #expect(tunVPN.shortBadgeText == "VPN")
+        #expect(tunVPN.interfaceName == "utun4")
+        #expect(tunVPN.virtualIP == "198.18.0.1")
+
+        let linkLocalOnly = SystemMonitorSampler.classifyVPNStatus(
+            primaryInterface: "en0",
+            activeIPv4ByInterface: ["en0": "192.168.1.20", "utun0": "169.254.1.2"],
+            connectedSystemVPN: nil,
+            proxy: .disabled
+        )
+        #expect(linkLocalOnly.kind == .direct)
+        #expect(linkLocalOnly.isVPNActive == false)
+        #expect(linkLocalOnly.shortBadgeText == nil)
+        #expect(linkLocalOnly.localIP == "192.168.1.20")
+
+        let proxyOnly = SystemMonitorSampler.classifyVPNStatus(
+            primaryInterface: "en0",
+            activeIPv4ByInterface: ["en0": "192.168.1.20"],
+            connectedSystemVPN: nil,
+            proxy: SystemProxyInfo(httpEndpoint: "127.0.0.1:7890", httpsEndpoint: nil, socksEndpoint: nil, pacURL: nil)
+        )
+        #expect(proxyOnly.kind == .systemProxy)
+        #expect(proxyOnly.isVPNActive == false)
+        #expect(proxyOnly.shortBadgeText == "代理")
     }
 }

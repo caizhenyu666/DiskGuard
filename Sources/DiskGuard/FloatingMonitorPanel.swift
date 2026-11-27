@@ -32,7 +32,24 @@ struct FloatingMonitorView: View {
     private var memory: MemoryStats { viewModel.systemSnapshot.memory }
     private var cpu: CPUStats { viewModel.systemSnapshot.cpu }
     private var health: MacHealthStats { viewModel.systemSnapshot.health }
+    private var vpn: VPNStatus { health.vpn }
     private var isTransparent: Bool { viewModel.floatingHUDStyle == .transparent }
+
+    private var vpnColor: Color {
+        switch vpn.kind {
+        case .systemVPN, .tunTunnel: return Color(red: 0.22, green: 0.85, blue: 0.56)
+        case .systemProxy: return Color(red: 0.36, green: 0.68, blue: 0.98)
+        case .direct: return secondaryTextColor
+        }
+    }
+
+    private var vpnHelpText: String {
+        var parts = [vpn.displayStatusText]
+        if let name = vpn.serviceName { parts.append(name) }
+        if let iface = vpn.interfaceName { parts.append(iface) }
+        if let proxy = vpn.proxy.summary { parts.append(proxy) }
+        return parts.joined(separator: " · ")
+    }
 
     private var pressureColor: Color {
         switch memory.pressure {
@@ -115,6 +132,21 @@ struct FloatingMonitorView: View {
                     .foregroundStyle(cpuAccentColor)
             }
 
+            if let badge = vpn.shortBadgeText {
+                Rectangle()
+                    .fill(dividerColor)
+                    .frame(width: 1, height: 11)
+
+                HStack(spacing: 3) {
+                    Image(systemName: "lock.shield.fill")
+                        .font(.system(size: 9))
+                    Text(badge)
+                        .fontWeight(.semibold)
+                }
+                .foregroundStyle(vpnColor)
+                .help(vpnHelpText)
+            }
+
             Button {
                 viewModel.toggleFloatingHUDCollapsed()
             } label: {
@@ -169,6 +201,21 @@ struct FloatingMonitorView: View {
                 Text("DiskGuard")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(primaryTextColor)
+
+                if let badge = vpn.shortBadgeText {
+                    HStack(spacing: 3) {
+                        Image(systemName: "lock.shield.fill")
+                            .font(.system(size: 8))
+                        Text(badge)
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    .foregroundStyle(vpnColor)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1.5)
+                    .background(vpnColor.opacity(isTransparent ? 0.22 : 0.14))
+                    .clipShape(Capsule())
+                    .help(vpnHelpText)
+                }
 
                 if health.thermal != .nominal {
                     Circle()
@@ -294,7 +341,6 @@ struct FloatingMonitorView: View {
                         style: StrokeStyle(lineWidth: 5, lineCap: .round)
                     )
                     .rotationEffect(.degrees(-90))
-                    .animation(.easeOut(duration: 0.25), value: clamped)
 
                 Text(percentText)
                     .font(.system(size: 10.5, weight: .bold).monospacedDigit())
@@ -388,6 +434,7 @@ final class FloatingMonitorController: ObservableObject {
     private weak var mainWindow: NSWindow?
     private var observers: [NSObjectProtocol] = []
     private var hasPositionedOnce = false
+    var onRequestOpenMainWindow: (() -> Void)?
 
     func attach(mainWindow: NSWindow, viewModel: AppViewModel) {
         if self.mainWindow === mainWindow {
@@ -413,9 +460,14 @@ final class FloatingMonitorController: ObservableObject {
                 self.syncVisibility(viewModel: viewModel)
             }
         }
-        let closeObs = nc.addObserver(forName: NSWindow.willCloseNotification, object: mainWindow, queue: .main) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.teardownPanel()
+        let closeObs = nc.addObserver(forName: NSWindow.willCloseNotification, object: mainWindow, queue: .main) { [weak self, weak viewModel] _ in
+            Task { @MainActor [weak self, weak viewModel] in
+                guard let self else { return }
+                self.detachObservers()
+                self.mainWindow = nil
+                if let viewModel, !viewModel.shouldShowFloatingHUD {
+                    self.panel?.orderOut(nil)
+                }
             }
         }
         observers = [minObs, deminObs, closeObs]
@@ -464,11 +516,14 @@ final class FloatingMonitorController: ObservableObject {
     }
 
     func restoreMainWindow() {
-        guard let mainWindow else { return }
-        if mainWindow.isMiniaturized {
-            mainWindow.deminiaturize(nil)
+        if let mainWindow {
+            if mainWindow.isMiniaturized {
+                mainWindow.deminiaturize(nil)
+            }
+            mainWindow.makeKeyAndOrderFront(nil)
+        } else {
+            onRequestOpenMainWindow?()
         }
-        mainWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 

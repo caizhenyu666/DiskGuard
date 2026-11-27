@@ -299,12 +299,43 @@ public struct ScanResult: Sendable {
 
 public enum DiskByteFormatter {
     public static func string(from bytes: Int64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB, .useTB]
-        formatter.includesUnit = true
-        formatter.isAdaptive = true
-        return formatter.string(fromByteCount: max(0, bytes))
+        let clamped = max(0, bytes)
+        if clamped < 1_000 {
+            return clamped == 0 ? "Zero KB" : "\(clamped) bytes"
+        }
+        let value = Double(clamped)
+        if clamped < 1_000_000 {
+            return "\(Int((value / 1_000.0).rounded())) KB"
+        }
+        if clamped < 1_000_000_000 {
+            return formatCompact(value / 1_000_000.0, decimals: 1, unit: "MB")
+        }
+        if clamped < 1_000_000_000_000 {
+            return formatCompact(value / 1_000_000_000.0, decimals: 2, unit: "GB")
+        }
+        return formatCompact(value / 1_000_000_000_000.0, decimals: 2, unit: "TB")
+    }
+
+    private static func formatCompact(_ value: Double, decimals: Int, unit: String) -> String {
+        let scale = decimals == 1 ? 10.0 : 100.0
+        let rounded = (value * scale).rounded() / scale
+        if decimals == 1 {
+            let tenths = Int((rounded * 10.0).rounded())
+            if tenths % 10 == 0 {
+                return "\(tenths / 10) \(unit)"
+            }
+            return "\(tenths / 10).\(tenths % 10) \(unit)"
+        }
+        let hundredths = Int((rounded * 100.0).rounded())
+        let whole = hundredths / 100
+        let frac = hundredths % 100
+        if frac == 0 {
+            return "\(whole) \(unit)"
+        }
+        if frac % 10 == 0 {
+            return "\(whole).\(frac / 10) \(unit)"
+        }
+        return frac < 10 ? "\(whole).0\(frac) \(unit)" : "\(whole).\(frac) \(unit)"
     }
 
     public static func compactPath(_ url: URL, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> String {

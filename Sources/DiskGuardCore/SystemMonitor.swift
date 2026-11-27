@@ -3,6 +3,7 @@ import Darwin
 import AppKit
 import IOKit
 import IOKit.ps
+import SystemConfiguration
 
 public enum MainSectionTab: String, CaseIterable, Sendable, Identifiable {
     case storage
@@ -38,12 +39,30 @@ public enum ProcessSortMetric: String, Sendable {
 
 public enum MemoryByteFormatter {
     public static func string(from bytes: UInt64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .memory
-        formatter.allowedUnits = [.useMB, .useGB, .useTB]
-        formatter.includesUnit = true
-        formatter.isAdaptive = true
-        return formatter.string(fromByteCount: Int64(min(bytes, UInt64(Int64.max))))
+        if bytes < 1_048_576 {
+            if bytes == 0 { return "0 MB" }
+            let mb = Double(bytes) / 1_048_576.0
+            let tenths = Int((mb * 10.0).rounded())
+            if tenths == 0 { return "0 MB" }
+            return tenths % 10 == 0 ? "\(tenths / 10) MB" : "\(tenths / 10).\(tenths % 10) MB"
+        }
+        let value = Double(bytes)
+        if bytes < 1_073_741_824 {
+            let tenths = Int(((value / 1_048_576.0) * 10.0).rounded())
+            return tenths % 10 == 0 ? "\(tenths / 10) MB" : "\(tenths / 10).\(tenths % 10) MB"
+        }
+        let divisor = bytes < 1_099_511_627_776 ? 1_073_741_824.0 : 1_099_511_627_776.0
+        let unit = bytes < 1_099_511_627_776 ? "GB" : "TB"
+        let hundredths = Int(((value / divisor) * 100.0).rounded())
+        let whole = hundredths / 100
+        let frac = hundredths % 100
+        if frac == 0 {
+            return "\(whole) \(unit)"
+        }
+        if frac % 10 == 0 {
+            return "\(whole).\(frac / 10) \(unit)"
+        }
+        return frac < 10 ? "\(whole).0\(frac) \(unit)" : "\(whole).\(frac) \(unit)"
     }
 
     public static func compactGB(_ bytes: UInt64) -> String {
@@ -423,29 +442,140 @@ public struct BatteryStats: Sendable, Equatable {
     }
 }
 
+public enum VPNConnectionKind: String, Sendable, Equatable {
+    case systemVPN
+    case tunTunnel
+    case systemProxy
+    case direct
+}
+
+public struct SystemProxyInfo: Sendable, Equatable {
+    public let httpEndpoint: String?
+    public let httpsEndpoint: String?
+    public let socksEndpoint: String?
+    public let pacURL: String?
+
+    public init(
+        httpEndpoint: String?,
+        httpsEndpoint: String?,
+        socksEndpoint: String?,
+        pacURL: String?
+    ) {
+        self.httpEndpoint = httpEndpoint
+        self.httpsEndpoint = httpsEndpoint
+        self.socksEndpoint = socksEndpoint
+        self.pacURL = pacURL
+    }
+
+    public static let disabled = SystemProxyInfo(
+        httpEndpoint: nil,
+        httpsEndpoint: nil,
+        socksEndpoint: nil,
+        pacURL: nil
+    )
+
+    public var isEnabled: Bool {
+        httpEndpoint != nil || httpsEndpoint != nil || socksEndpoint != nil || pacURL != nil
+    }
+
+    public var summary: String? {
+        if let httpsEndpoint { return "HTTPS \(httpsEndpoint)" }
+        if let httpEndpoint { return "HTTP \(httpEndpoint)" }
+        if let socksEndpoint { return "SOCKS \(socksEndpoint)" }
+        if let pacURL { return "PAC \(pacURL)" }
+        return nil
+    }
+}
+
+public struct VPNStatus: Sendable, Equatable {
+    public let kind: VPNConnectionKind
+    public let isVPNActive: Bool
+    public let serviceName: String?
+    public let interfaceName: String?
+    public let virtualIP: String?
+    public let primaryInterface: String?
+    public let localIP: String?
+    public let proxy: SystemProxyInfo
+
+    public init(
+        kind: VPNConnectionKind,
+        isVPNActive: Bool,
+        serviceName: String?,
+        interfaceName: String?,
+        virtualIP: String?,
+        primaryInterface: String?,
+        localIP: String?,
+        proxy: SystemProxyInfo
+    ) {
+        self.kind = kind
+        self.isVPNActive = isVPNActive
+        self.serviceName = serviceName
+        self.interfaceName = interfaceName
+        self.virtualIP = virtualIP
+        self.primaryInterface = primaryInterface
+        self.localIP = localIP
+        self.proxy = proxy
+    }
+
+    public static let direct = VPNStatus(
+        kind: .direct,
+        isVPNActive: false,
+        serviceName: nil,
+        interfaceName: nil,
+        virtualIP: nil,
+        primaryInterface: nil,
+        localIP: nil,
+        proxy: .disabled
+    )
+
+    public var shortBadgeText: String? {
+        switch kind {
+        case .systemVPN, .tunTunnel:
+            return "VPN"
+        case .systemProxy:
+            return "代理"
+        case .direct:
+            return nil
+        }
+    }
+
+    public var displayStatusText: String {
+        switch kind {
+        case .systemVPN: return "VPN 已连接"
+        case .tunTunnel: return "TUN 隧道活跃"
+        case .systemProxy: return "系统代理已开启"
+        case .direct: return "直连网络"
+        }
+    }
+}
+
 public struct MacHealthStats: Sendable, Equatable {
     public let uptimeSeconds: TimeInterval
     public let thermal: ThermalLevel
     public let network: NetworkStats
     public let battery: BatteryStats?
+    public let vpn: VPNStatus
 
     public init(
         uptimeSeconds: TimeInterval,
         thermal: ThermalLevel,
         network: NetworkStats,
-        battery: BatteryStats?
+        battery: BatteryStats?,
+        vpn: VPNStatus = .direct
     ) {
         self.uptimeSeconds = uptimeSeconds
         self.thermal = thermal
         self.network = network
         self.battery = battery
+        self.vpn = vpn
     }
 
     public static let empty = MacHealthStats(
         uptimeSeconds: 0,
         thermal: .nominal,
         network: .zero,
-        battery: nil
+        battery: nil,
+        vpn: .direct
     )
 }
 
@@ -455,6 +585,8 @@ public struct SystemSnapshot: Sendable, Equatable {
     public let cpu: CPUStats
     public let topProcesses: [ProcessMemoryInfo]
     public let processes: [ProcessEntry]
+    public let memoryGroups: [ProcessGroup]
+    public let cpuGroups: [ProcessGroup]
     public let health: MacHealthStats
 
     public init(
@@ -463,6 +595,8 @@ public struct SystemSnapshot: Sendable, Equatable {
         cpu: CPUStats,
         topProcesses: [ProcessMemoryInfo],
         processes: [ProcessEntry] = [],
+        memoryGroups: [ProcessGroup] = [],
+        cpuGroups: [ProcessGroup] = [],
         health: MacHealthStats = .empty
     ) {
         self.timestamp = timestamp
@@ -470,6 +604,8 @@ public struct SystemSnapshot: Sendable, Equatable {
         self.cpu = cpu
         self.topProcesses = topProcesses
         self.processes = processes
+        self.memoryGroups = memoryGroups
+        self.cpuGroups = cpuGroups
         self.health = health
     }
 }
@@ -597,9 +733,18 @@ public enum ProcessController {
 }
 
 public final class SystemMonitorSampler: @unchecked Sendable {
+    private struct CachedPIDInfo: Sendable {
+        let startAbstime: UInt64
+        let name: String
+        let executablePath: String
+        let appBundlePath: String?
+        let isProtected: Bool
+    }
+
     private let lock = NSLock()
     private var previousCPUTicks: CPUTickSnapshot?
     private var previousProcCPUTimes: [Int32: (cpuTicks: UInt64, wallTicks: UInt64)] = [:]
+    private var pidMetadataCache: [Int32: CachedPIDInfo] = [:]
     private var previousNetwork: (rx: UInt64, tx: UInt64, time: TimeInterval)?
 
     private static let protectedNames: Set<String> = [
@@ -644,6 +789,7 @@ public final class SystemMonitorSampler: @unchecked Sendable {
         let prevNet = previousNetwork
         previousNetwork = (netTotals.rx, netTotals.tx, wallNow)
         let prevProcMap = previousProcCPUTimes
+        let prevPIDCache = pidMetadataCache
         lock.unlock()
 
         let cpu: CPUStats
@@ -677,22 +823,29 @@ public final class SystemMonitorSampler: @unchecked Sendable {
             uptimeSeconds: wallNow,
             thermal: ThermalLevel(processThermalState: ProcessInfo.processInfo.thermalState),
             network: netStats,
-            battery: Self.readBatteryStats()
+            battery: Self.readBatteryStats(),
+            vpn: Self.readVPNStatus()
         )
 
         var entries: [ProcessEntry] = []
         var topProcesses: [ProcessMemoryInfo] = []
+        var memoryGroups: [ProcessGroup] = []
+        var cpuGroups: [ProcessGroup] = []
 
         if includeTopProcesses {
-            let (sampledEntries, nextProcMap) = Self.readAllProcesses(
+            let (sampledEntries, nextProcMap, nextPIDCache) = Self.readAllProcesses(
                 previousCPUTimes: prevProcMap,
+                cachedPIDs: prevPIDCache,
                 coreCount: coreCount
             )
             lock.lock()
             previousProcCPUTimes = nextProcMap
+            pidMetadataCache = nextPIDCache
             lock.unlock()
 
             entries = sampledEntries
+            memoryGroups = Self.groupProcesses(sampledEntries, sortBy: .memory)
+            cpuGroups = Self.groupProcesses(sampledEntries, sortBy: .cpu)
             topProcesses = sampledEntries
                 .sorted { $0.footprintBytes > $1.footprintBytes }
                 .prefix(max(0, topLimit))
@@ -705,6 +858,8 @@ public final class SystemMonitorSampler: @unchecked Sendable {
             cpu: cpu,
             topProcesses: topProcesses,
             processes: entries,
+            memoryGroups: memoryGroups,
+            cpuGroups: cpuGroups,
             health: health
         )
     }
@@ -947,6 +1102,262 @@ public final class SystemMonitorSampler: @unchecked Sendable {
         return (totalIn, totalOut)
     }
 
+    public static func parseProxySettings(_ dict: [String: Any]) -> SystemProxyInfo {
+        func endpoint(enableKey: String, hostKey: String, portKey: String) -> String? {
+            guard (dict[enableKey] as? NSNumber)?.intValue == 1,
+                  let rawHost = dict[hostKey] as? String else {
+                return nil
+            }
+            let host = rawHost.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !host.isEmpty else { return nil }
+            if let port = (dict[portKey] as? NSNumber)?.intValue, port > 0 {
+                return "\(host):\(port)"
+            }
+            return host
+        }
+
+        let pac: String?
+        if (dict["ProxyAutoConfigEnable"] as? NSNumber)?.intValue == 1,
+           let rawPAC = dict["ProxyAutoConfigURLString"] as? String {
+            let trimmed = rawPAC.trimmingCharacters(in: .whitespacesAndNewlines)
+            pac = trimmed.isEmpty ? nil : trimmed
+        } else {
+            pac = nil
+        }
+
+        return SystemProxyInfo(
+            httpEndpoint: endpoint(enableKey: "HTTPEnable", hostKey: "HTTPProxy", portKey: "HTTPPort"),
+            httpsEndpoint: endpoint(enableKey: "HTTPSEnable", hostKey: "HTTPSProxy", portKey: "HTTPSPort"),
+            socksEndpoint: endpoint(enableKey: "SOCKSEnable", hostKey: "SOCKSProxy", portKey: "SOCKSPort"),
+            pacURL: pac
+        )
+    }
+
+    public static func isUsableNonLinkLocalIPv4(_ ip: String) -> Bool {
+        let trimmed = ip.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed.hasPrefix("127.") || trimmed.hasPrefix("169.254.") || trimmed.hasPrefix("0.") {
+            return false
+        }
+        return true
+    }
+
+    public static func isVPNInterfaceName(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        let prefixes = ["utun", "ppp", "ipsec", "wg", "tun", "tap", "gpd", "feth"]
+        return prefixes.contains { lower.hasPrefix($0) }
+    }
+
+    public static func classifyVPNStatus(
+        primaryInterface: String?,
+        activeIPv4ByInterface: [String: String],
+        connectedSystemVPN: (serviceName: String, interfaceName: String?, virtualIP: String?)?,
+        proxy: SystemProxyInfo
+    ) -> VPNStatus {
+        let localIP: String? = {
+            if let primaryInterface,
+               !isVPNInterfaceName(primaryInterface),
+               let ip = activeIPv4ByInterface[primaryInterface],
+               isUsableNonLinkLocalIPv4(ip) {
+                return ip
+            }
+            let candidate = activeIPv4ByInterface.keys
+                .filter { $0.lowercased().hasPrefix("en") && isUsableNonLinkLocalIPv4(activeIPv4ByInterface[$0] ?? "") }
+                .sorted()
+                .first
+            if let candidate {
+                return activeIPv4ByInterface[candidate]
+            }
+            let fallback = activeIPv4ByInterface.keys
+                .filter { !isVPNInterfaceName($0) && isUsableNonLinkLocalIPv4(activeIPv4ByInterface[$0] ?? "") }
+                .sorted()
+                .first
+            return fallback.flatMap { activeIPv4ByInterface[$0] }
+        }()
+
+        if let vpn = connectedSystemVPN {
+            let resolvedIP = vpn.virtualIP
+                ?? vpn.interfaceName.flatMap { activeIPv4ByInterface[$0] }
+            return VPNStatus(
+                kind: .systemVPN,
+                isVPNActive: true,
+                serviceName: vpn.serviceName,
+                interfaceName: vpn.interfaceName,
+                virtualIP: resolvedIP,
+                primaryInterface: primaryInterface,
+                localIP: localIP,
+                proxy: proxy
+            )
+        }
+
+        let vpnInterfaces = activeIPv4ByInterface.keys
+            .filter { name in
+                isVPNInterfaceName(name) && isUsableNonLinkLocalIPv4(activeIPv4ByInterface[name] ?? "")
+            }
+            .sorted()
+
+        let activeTUN: String? = {
+            if let primaryInterface, vpnInterfaces.contains(primaryInterface) {
+                return primaryInterface
+            }
+            return vpnInterfaces.first
+        }()
+
+        if let activeTUN {
+            return VPNStatus(
+                kind: .tunTunnel,
+                isVPNActive: true,
+                serviceName: nil,
+                interfaceName: activeTUN,
+                virtualIP: activeIPv4ByInterface[activeTUN],
+                primaryInterface: primaryInterface,
+                localIP: localIP,
+                proxy: proxy
+            )
+        }
+
+        if proxy.isEnabled {
+            return VPNStatus(
+                kind: .systemProxy,
+                isVPNActive: false,
+                serviceName: nil,
+                interfaceName: nil,
+                virtualIP: nil,
+                primaryInterface: primaryInterface,
+                localIP: localIP,
+                proxy: proxy
+            )
+        }
+
+        return VPNStatus(
+            kind: .direct,
+            isVPNActive: false,
+            serviceName: nil,
+            interfaceName: nil,
+            virtualIP: nil,
+            primaryInterface: primaryInterface,
+            localIP: localIP,
+            proxy: proxy
+        )
+    }
+
+    public static func readVPNStatus() -> VPNStatus {
+        let proxyDict = SCDynamicStoreCopyProxies(nil) as? [String: Any] ?? [:]
+        let proxy = parseProxySettings(proxyDict)
+        let activeIPv4 = readActiveIPv4ByInterface()
+
+        guard let store = SCDynamicStoreCreate(nil, "DiskGuard" as CFString, nil, nil) else {
+            return classifyVPNStatus(
+                primaryInterface: nil,
+                activeIPv4ByInterface: activeIPv4,
+                connectedSystemVPN: nil,
+                proxy: proxy
+            )
+        }
+
+        let globalIPv4 = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any]
+        let primaryInterface = globalIPv4?["PrimaryInterface"] as? String
+
+        let serviceKeys = (SCDynamicStoreCopyKeyList(store, "State:/Network/Service/[^/]+/(PPP|IPSec|VPN|IPv4)" as CFString) as? [String]) ?? []
+        var groupedSuffixes: [String: Set<String>] = [:]
+        for key in serviceKeys {
+            let parts = key.split(separator: "/")
+            guard parts.count >= 5 else { continue }
+            let serviceID = String(parts[3])
+            let suffix = String(parts[4])
+            groupedSuffixes[serviceID, default: []].insert(suffix)
+        }
+
+        var connectedVPN: (serviceName: String, interfaceName: String?, virtualIP: String?)?
+        let vpnTypes: Set<String> = ["PPP", "IPSec", "VPN", "com.apple.NetworkExtension"]
+
+        for serviceID in groupedSuffixes.keys.sorted() {
+            let suffixes = groupedSuffixes[serviceID] ?? []
+            let setupIf = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(serviceID)/Interface" as CFString) as? [String: Any]
+            let ifType = setupIf?["Type"] as? String
+            let ifSubType = setupIf?["SubType"] as? String
+            let hasVPNStateSubkey = suffixes.contains("PPP") || suffixes.contains("IPSec") || suffixes.contains("VPN")
+            let isVPNSetup = (ifType.map { vpnTypes.contains($0) } ?? false) || (ifSubType.map { vpnTypes.contains($0) } ?? false)
+
+            let ipv4Dict = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/IPv4" as CFString) as? [String: Any]
+            let stateIface = ipv4Dict?["InterfaceName"] as? String
+            let stateAddresses = (ipv4Dict?["Addresses"] as? [String]) ?? []
+            let stateIPv4 = stateAddresses.first(where: isUsableNonLinkLocalIPv4)
+            let isVPNIface = stateIface.map(isVPNInterfaceName) ?? false
+
+            guard hasVPNStateSubkey || isVPNSetup || isVPNIface else { continue }
+
+            var connectedByProto = false
+            var protoIface: String?
+            for proto in ["VPN", "IPSec", "PPP"] where suffixes.contains(proto) {
+                if let protoDict = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/\(proto)" as CFString) as? [String: Any] {
+                    if let pIface = protoDict["InterfaceName"] as? String {
+                        protoIface = pIface
+                    }
+                    if let statusNum = (protoDict["Status"] as? NSNumber)?.intValue {
+                        if statusNum == 8 || statusNum == 2 {
+                            connectedByProto = true
+                        }
+                    } else if stateIPv4 != nil {
+                        connectedByProto = true
+                    }
+                }
+            }
+
+            let resolvedIface = stateIface ?? protoIface
+            let ifaceHasIP = resolvedIface.flatMap { activeIPv4[$0] }.map(isUsableNonLinkLocalIPv4) ?? false
+            guard connectedByProto || stateIPv4 != nil || ifaceHasIP else { continue }
+
+            let setupService = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(serviceID)" as CFString) as? [String: Any]
+            let serviceName = (setupService?["UserDefinedName"] as? String) ?? resolvedIface ?? "VPN"
+            connectedVPN = (serviceName: serviceName, interfaceName: resolvedIface, virtualIP: stateIPv4)
+            break
+        }
+
+        return classifyVPNStatus(
+            primaryInterface: primaryInterface,
+            activeIPv4ByInterface: activeIPv4,
+            connectedSystemVPN: connectedVPN,
+            proxy: proxy
+        )
+    }
+
+    private static func readActiveIPv4ByInterface() -> [String: String] {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else {
+            return [:]
+        }
+        defer { freeifaddrs(first) }
+
+        var result: [String: String] = [:]
+        var ptr: UnsafeMutablePointer<ifaddrs>? = first
+        var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+
+        while let current = ptr {
+            let flags = Int32(current.pointee.ifa_flags)
+            let required = IFF_UP | IFF_RUNNING
+            let isUpRunning = (flags & required) == required
+            let isLoopback = (flags & IFF_LOOPBACK) != 0
+
+            if isUpRunning,
+               !isLoopback,
+               let namePtr = current.pointee.ifa_name,
+               let addr = current.pointee.ifa_addr,
+               addr.pointee.sa_family == UInt8(AF_INET) {
+                var sinAddr = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+                if inet_ntop(AF_INET, &sinAddr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil {
+                    let ip = decodeCBuffer(buffer, maxLength: Int(INET_ADDRSTRLEN))
+                    let iface = String(cString: namePtr)
+                    if isUsableNonLinkLocalIPv4(ip), result[iface] == nil {
+                        result[iface] = ip
+                    }
+                }
+            }
+            ptr = current.pointee.ifa_next
+        }
+        return result
+    }
+
     private static func readBatteryStats() -> BatteryStats? {
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
         guard service != 0 else { return nil }
@@ -985,29 +1396,29 @@ public final class SystemMonitorSampler: @unchecked Sendable {
 
     private static func readAllProcesses(
         previousCPUTimes: [Int32: (cpuTicks: UInt64, wallTicks: UInt64)],
+        cachedPIDs: [Int32: CachedPIDInfo],
         coreCount: Int
-    ) -> (entries: [ProcessEntry], cpuMap: [Int32: (cpuTicks: UInt64, wallTicks: UInt64)]) {
-        var runningInfoByPID: [Int32: (name: String?, bundleID: String?, bundlePath: String?)] = [:]
-        for app in NSWorkspace.shared.runningApplications {
-            runningInfoByPID[app.processIdentifier] = (
-                app.localizedName,
-                app.bundleIdentifier,
-                app.bundleURL?.path
-            )
-        }
+    ) -> (
+        entries: [ProcessEntry],
+        cpuMap: [Int32: (cpuTicks: UInt64, wallTicks: UInt64)],
+        pidCache: [Int32: CachedPIDInfo]
+    ) {
+        var lazyRunningInfo: [Int32: (name: String?, bundleID: String?, bundlePath: String?)]?
 
-        let estimatedBytes = proc_listallpids(nil, 0)
-        let capacity = max(256, Int(estimatedBytes / Int32(MemoryLayout<Int32>.size)) + 64)
+        let estimatedCount = proc_listallpids(nil, 0)
+        let capacity = max(512, Int(estimatedCount) + 128)
         var pids = [Int32](repeating: 0, count: capacity)
-        let actualBytes = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<Int32>.size))
-        guard actualBytes > 0 else { return ([], [:]) }
+        let actualCount = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<Int32>.size))
+        guard actualCount > 0 else { return ([], [:], [:]) }
 
-        let pidCount = Int(actualBytes) / MemoryLayout<Int32>.size
+        let pidCount = min(Int(actualCount), pids.count)
         let wallNow = mach_absolute_time()
         var entries: [ProcessEntry] = []
-        entries.reserveCapacity(min(pidCount, 256))
+        entries.reserveCapacity(min(pidCount, 512))
         var nextCPUMap: [Int32: (cpuTicks: UInt64, wallTicks: UInt64)] = [:]
-        nextCPUMap.reserveCapacity(min(pidCount, 256))
+        nextCPUMap.reserveCapacity(pidCount)
+        var nextPIDCache: [Int32: CachedPIDInfo] = [:]
+        nextPIDCache.reserveCapacity(min(pidCount, 512))
 
         var nameBuffer = [CChar](repeating: 0, count: 256)
         var pathBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 2)
@@ -1041,54 +1452,85 @@ public final class SystemMonitorSampler: @unchecked Sendable {
             let footprint = rusage.ri_phys_footprint
             guard footprint > 0 || cpuPercent >= 0.1 else { continue }
 
-            let running = runningInfoByPID[pid]
-            let pathLen = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
-            let execPath: String
-            if pathLen > 0 {
-                let bytes = pathBuffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }
-                execPath = String(decoding: bytes, as: UTF8.self)
+            let info: CachedPIDInfo
+            if let cached = cachedPIDs[pid], cached.startAbstime == rusage.ri_proc_start_abstime {
+                info = cached
             } else {
-                execPath = ""
-            }
-
-            let name: String
-            if let appName = running?.name, !appName.isEmpty {
-                name = appName
-            } else {
-                let len = proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
-                if len > 0 {
-                    let utf8Bytes = nameBuffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }
-                    name = String(decoding: utf8Bytes, as: UTF8.self)
-                } else if !execPath.isEmpty {
-                    name = URL(fileURLWithPath: execPath).lastPathComponent
-                } else {
-                    name = "PID \(pid)"
+                if lazyRunningInfo == nil {
+                    var map: [Int32: (name: String?, bundleID: String?, bundlePath: String?)] = [:]
+                    for app in NSWorkspace.shared.runningApplications {
+                        map[app.processIdentifier] = (
+                            app.localizedName,
+                            app.bundleIdentifier,
+                            app.bundleURL?.path
+                        )
+                    }
+                    lazyRunningInfo = map
                 }
+                let running = lazyRunningInfo?[pid]
+
+                let pathLen = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+                let execPath = pathLen > 0 ? Self.decodeCBuffer(pathBuffer, maxLength: Int(pathLen)) : ""
+
+                let name: String
+                if let appName = running?.name, !appName.isEmpty {
+                    name = appName
+                } else {
+                    let len = proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
+                    if len > 0 {
+                        name = Self.decodeCBuffer(nameBuffer, maxLength: Int(len))
+                    } else if !execPath.isEmpty {
+                        name = URL(fileURLWithPath: execPath).lastPathComponent
+                    } else {
+                        name = "PID \(pid)"
+                    }
+                }
+
+                let bundlePath = Self.outermostAppBundlePath(from: execPath) ?? running?.bundlePath
+                let uid = readProcessUID(pid: pid)
+                let isProtected = isProtectedProcess(
+                    pid: pid,
+                    uid: uid,
+                    name: name,
+                    bundleID: running?.bundleID,
+                    selfPID: selfPID,
+                    selfUID: selfUID
+                )
+
+                info = CachedPIDInfo(
+                    startAbstime: rusage.ri_proc_start_abstime,
+                    name: name,
+                    executablePath: execPath,
+                    appBundlePath: bundlePath,
+                    isProtected: isProtected
+                )
             }
 
-            let bundlePath = Self.outermostAppBundlePath(from: execPath) ?? running?.bundlePath
-            let uid = readProcessUID(pid: pid)
-            let isProtected = isProtectedProcess(
-                pid: pid,
-                uid: uid,
-                name: name,
-                bundleID: running?.bundleID,
-                selfPID: selfPID,
-                selfUID: selfUID
-            )
-
+            nextPIDCache[pid] = info
             entries.append(ProcessEntry(
                 pid: pid,
-                name: name,
-                executablePath: execPath,
-                appBundlePath: bundlePath,
+                name: info.name,
+                executablePath: info.executablePath,
+                appBundlePath: info.appBundlePath,
                 footprintBytes: footprint,
                 cpuPercent: cpuPercent,
-                isProtected: isProtected
+                isProtected: info.isProtected
             ))
         }
 
-        return (entries, nextCPUMap)
+        return (entries, nextCPUMap, nextPIDCache)
+    }
+
+    private static func decodeCBuffer(_ buffer: [CChar], maxLength: Int) -> String {
+        buffer.withUnsafeBufferPointer { raw in
+            guard let base = raw.baseAddress else { return "" }
+            let bound = max(0, min(maxLength, raw.count))
+            return base.withMemoryRebound(to: UInt8.self, capacity: bound) { ptr in
+                let bytes = UnsafeBufferPointer(start: ptr, count: bound)
+                let end = bytes.firstIndex(of: 0) ?? bound
+                return String(decoding: bytes[..<end], as: UTF8.self)
+            }
+        }
     }
 
     private static func readProcessUID(pid: Int32) -> uid_t? {
@@ -1101,8 +1543,9 @@ public final class SystemMonitorSampler: @unchecked Sendable {
 
     public static func readTopProcesses(limit: Int = 5) -> [ProcessMemoryInfo] {
         guard limit > 0 else { return [] }
-        let (entries, _) = readAllProcesses(
+        let (entries, _, _) = readAllProcesses(
             previousCPUTimes: [:],
+            cachedPIDs: [:],
             coreCount: ProcessInfo.processInfo.activeProcessorCount
         )
         return entries

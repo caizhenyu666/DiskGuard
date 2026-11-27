@@ -3,7 +3,8 @@ import DiskGuardCore
 
 struct MainView: View {
     @ObservedObject var viewModel: AppViewModel
-    @StateObject private var floatingController = FloatingMonitorController()
+    @ObservedObject var floatingController: FloatingMonitorController
+    @Environment(\.openWindow) private var openWindow
     @State private var hoveredID: String?
 
     var body: some View {
@@ -53,17 +54,18 @@ struct MainView: View {
             }
         )
         .onAppear {
-            viewModel.applyAppAppearance()
-            viewModel.startSystemMonitoring()
-            if viewModel.items.isEmpty && !viewModel.isScanning {
-                viewModel.startScan()
-            }
-            viewModel.checkForUpdatesOnLaunchIfNeeded()
+            appSetupOnAppear()
+        }
+        .onChange(of: viewModel.showMenuBarExtra) { _, newValue in
+            AppDelegate.shared?.keepAliveInMenuBar = newValue
         }
         .onChange(of: viewModel.shouldShowFloatingHUD) { _, _ in
             floatingController.syncVisibility(viewModel: viewModel)
         }
         .onChange(of: viewModel.floatingHUDCollapsed) { _, _ in
+            floatingController.updatePanelSize(viewModel: viewModel)
+        }
+        .onChange(of: viewModel.systemSnapshot.health.vpn.shortBadgeText) { _, _ in
             floatingController.updatePanelSize(viewModel: viewModel)
         }
         .alert(
@@ -73,12 +75,18 @@ struct MainView: View {
                 set: { if !$0 { viewModel.cancelPendingProcessTermination() } }
             ),
             presenting: viewModel.pendingProcessTermination
-        ) { _ in
+        ) { action in
             Button("取消", role: .cancel) {
                 viewModel.cancelPendingProcessTermination()
             }
-            Button("强制结束", role: .destructive) {
-                viewModel.confirmPendingProcessTermination()
+            if action.isDestructive {
+                Button(action.confirmButtonTitle, role: .destructive) {
+                    viewModel.confirmPendingProcessTermination()
+                }
+            } else {
+                Button(action.confirmButtonTitle) {
+                    viewModel.confirmPendingProcessTermination()
+                }
             }
         } message: { action in
             Text(action.message)
@@ -171,8 +179,41 @@ struct MainView: View {
                 }
                 .buttonStyle(.bordered)
                 .help("外观模式：\(viewModel.appearanceMode.displayName)（点击切换）")
+
+                Menu {
+                    Toggle("菜单栏常驻图标", isOn: $viewModel.showMenuBarExtra)
+                    Toggle("菜单栏显示实时数值", isOn: $viewModel.showMenuBarMetrics)
+                        .disabled(!viewModel.showMenuBarExtra)
+                    Divider()
+                    Toggle("最小化时自动显示悬浮窗", isOn: $viewModel.floatingHUDOnMinimize)
+                    Toggle(
+                        "登录时自动启动",
+                        isOn: Binding(
+                            get: { viewModel.launchAtLogin },
+                            set: { viewModel.setLaunchAtLogin($0) }
+                        )
+                    )
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 12))
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("常驻菜单栏与偏好设置")
             }
         }
+    }
+
+    private func appSetupOnAppear() {
+        viewModel.applyAppAppearance()
+        viewModel.startSystemMonitoring()
+        floatingController.onRequestOpenMainWindow = { openWindow(id: "main") }
+        AppDelegate.shared?.onReopenRequest = { openWindow(id: "main") }
+        AppDelegate.shared?.keepAliveInMenuBar = viewModel.showMenuBarExtra
+        if viewModel.items.isEmpty && !viewModel.isScanning {
+            viewModel.startScan()
+        }
+        viewModel.checkForUpdatesOnLaunchIfNeeded()
     }
 
     private func sectionTabButton(_ tab: MainSectionTab) -> some View {
@@ -186,7 +227,7 @@ struct MainView: View {
             case .cpu:
                 return String(format: "%.0f%%", viewModel.systemSnapshot.cpu.totalUsage * 100)
             case .health:
-                return nil
+                return viewModel.systemSnapshot.health.vpn.shortBadgeText
             }
         }()
 
@@ -855,42 +896,66 @@ struct MainView: View {
     private var bottomDrawerSection: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                if viewModel.isCleaning {
-                    ProgressView(value: viewModel.cleanProgress)
-                        .frame(width: 120)
-                    Text("正在安全移入废纸篓...")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                } else if viewModel.isScanning {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text(viewModel.scanProgressText)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("\(viewModel.scanProgressText) · 已选 \(viewModel.selectedItems.count) 项（\(DiskByteFormatter.string(from: viewModel.selectedBytes))）")
-                        .font(.system(size: 12).monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                Button {
-                    viewModel.openTrashInApp()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "trash")
-                        if viewModel.trashBytes > 0 {
-                            Text("管理废纸篓 (\(DiskByteFormatter.string(from: viewModel.trashBytes)))")
-                                .monospacedDigit()
-                        } else {
-                            Text("管理废纸篓")
-                        }
+                if viewModel.activeSection == .storage {
+                    if viewModel.isCleaning {
+                        ProgressView(value: viewModel.cleanProgress)
+                            .frame(width: 120)
+                        Text("正在安全移入废纸篓...")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    } else if viewModel.isScanning {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(viewModel.scanProgressText)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("\(viewModel.scanProgressText) · 已选 \(viewModel.selectedItems.count) 项（\(DiskByteFormatter.string(from: viewModel.selectedBytes))）")
+                            .font(.system(size: 12).monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
-                    .font(.system(size: 11.5))
+
+                    Spacer()
+
+                    Button {
+                        viewModel.openTrashInApp()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "trash")
+                            if viewModel.trashBytes > 0 {
+                                Text("管理废纸篓 (\(DiskByteFormatter.string(from: viewModel.trashBytes)))")
+                                    .monospacedDigit()
+                            } else {
+                                Text("管理废纸篓")
+                            }
+                        }
+                        .font(.system(size: 11.5))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                } else {
+                    if let lastLog = viewModel.logs.last {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(logColor(lastLog.level))
+                                .frame(width: 6, height: 6)
+                            Text(Self.timeFormatter.string(from: lastLog.timestamp))
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Text(lastLog.message)
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                    } else {
+                        Text("实时监控运行中 · 每 2 秒更新（VPN：\(viewModel.systemSnapshot.health.vpn.displayStatusText)）")
+                            .font(.system(size: 11.5).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
 
                 Button {
                     withAnimation(.easeInOut(duration: 0.18)) {
@@ -899,7 +964,7 @@ struct MainView: View {
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: viewModel.isLogDrawerExpanded ? "chevron.down" : "chevron.up")
-                        Text("清理日志 (\(viewModel.logs.count))")
+                        Text("\(viewModel.activeSection == .storage ? "清理日志" : "活动日志") (\(viewModel.logs.count))")
                             .monospacedDigit()
                     }
                     .font(.system(size: 11.5))
