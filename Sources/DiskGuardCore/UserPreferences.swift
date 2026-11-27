@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 public struct UserPreferences: Sendable {
     public let suiteName: String?
@@ -19,6 +20,11 @@ public struct UserPreferences: Sendable {
         static let activeMainSection = "diskguard.activeMainSection"
         static let showMenuBarExtra = "diskguard.showMenuBarExtra"
         static let showMenuBarMetrics = "diskguard.showMenuBarMetrics"
+        static let floatingHUDMode = "diskguard.floatingHUDMode"
+        static let activePetID = "diskguard.activePetID"
+        static let petDisplaySize = "diskguard.petDisplaySize"
+        static let floatingHUDOriginX = "diskguard.floatingHUDOriginX"
+        static let floatingHUDOriginY = "diskguard.floatingHUDOriginY"
     }
 
     private var defaults: UserDefaults {
@@ -144,6 +150,70 @@ public struct UserPreferences: Sendable {
         }
         nonmutating set {
             defaults.set(newValue, forKey: Keys.showMenuBarMetrics)
+        }
+    }
+
+    public var floatingHUDMode: FloatingHUDMode {
+        get {
+            if let raw = defaults.string(forKey: Keys.floatingHUDMode),
+               let mode = FloatingHUDMode(rawValue: raw) {
+                return mode
+            }
+            if defaults.bool(forKey: Keys.floatingHUDCollapsed) {
+                return .pill
+            }
+            return .pet
+        }
+        nonmutating set {
+            defaults.set(newValue.rawValue, forKey: Keys.floatingHUDMode)
+        }
+    }
+
+    public var activePetID: String {
+        get {
+            let value = defaults.string(forKey: Keys.activePetID)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let value, !value.isEmpty {
+                return value
+            }
+            return PetPack.builtInWestieID
+        }
+        nonmutating set {
+            defaults.set(newValue, forKey: Keys.activePetID)
+        }
+    }
+
+    public var petDisplaySize: PetDisplaySize {
+        get {
+            guard let raw = defaults.string(forKey: Keys.petDisplaySize),
+                  let size = PetDisplaySize(rawValue: raw) else {
+                return .medium
+            }
+            return size
+        }
+        nonmutating set {
+            defaults.set(newValue.rawValue, forKey: Keys.petDisplaySize)
+        }
+    }
+
+    public var floatingHUDOrigin: CGPoint? {
+        get {
+            guard defaults.object(forKey: Keys.floatingHUDOriginX) != nil,
+                  defaults.object(forKey: Keys.floatingHUDOriginY) != nil else {
+                return nil
+            }
+            return CGPoint(
+                x: defaults.double(forKey: Keys.floatingHUDOriginX),
+                y: defaults.double(forKey: Keys.floatingHUDOriginY)
+            )
+        }
+        nonmutating set {
+            if let newValue {
+                defaults.set(Double(newValue.x), forKey: Keys.floatingHUDOriginX)
+                defaults.set(Double(newValue.y), forKey: Keys.floatingHUDOriginY)
+            } else {
+                defaults.removeObject(forKey: Keys.floatingHUDOriginX)
+                defaults.removeObject(forKey: Keys.floatingHUDOriginY)
+            }
         }
     }
 }

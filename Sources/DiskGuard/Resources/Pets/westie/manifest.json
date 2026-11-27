@@ -1,0 +1,12 @@
+{
+  "id": "westie",
+  "name": "西高地",
+  "version": 1,
+  "moodFiles": {
+    "idle": "idle.png",
+    "happy": "happy.png",
+    "busy": "busy.png",
+    "stressed": "stressed.png",
+    "sleepy": "sleepy.png"
+  }
+}

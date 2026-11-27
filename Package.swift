@@ -23,7 +23,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "DiskGuard",
-            dependencies: ["DiskGuardCore"]
+            dependencies: ["DiskGuardCore"],
+            resources: [
+                .copy("Resources/Pets")
+            ]
         ),
         .testTarget(
             name: "DiskGuardCoreTests",

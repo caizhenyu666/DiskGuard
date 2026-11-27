@@ -71,8 +71,11 @@ struct MenuBarPopoverView: View {
         .padding(14)
         .frame(width: 304)
         .onAppear {
+            floatingController.bind(viewModel: viewModel)
             floatingController.onRequestOpenMainWindow = { openWindow(id: "main") }
-            AppDelegate.shared?.onReopenRequest = { openWindow(id: "main") }
+            AppDelegate.shared?.onReopenRequest = { [weak floatingController] in
+                floatingController?.restoreMainWindow()
+            }
             AppDelegate.shared?.keepAliveInMenuBar = viewModel.showMenuBarExtra
             viewModel.startSystemMonitoring()
         }
@@ -251,8 +254,25 @@ struct MenuBarPopoverView: View {
     }
 
     private var togglesSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Toggle("常驻右上角悬浮窗", isOn: $viewModel.floatingHUDAlwaysOn)
+        VStack(alignment: .leading, spacing: 7) {
+            Toggle("常驻桌面悬浮窗", isOn: $viewModel.floatingHUDAlwaysOn)
+
+            HStack(spacing: 8) {
+                Text("悬浮形态")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Picker("", selection: $viewModel.floatingHUDMode) {
+                    ForEach(FloatingHUDMode.allCases) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .controlSize(.small)
+                .frame(width: 196)
+            }
+
             Toggle("菜单栏显示实时数值", isOn: $viewModel.showMenuBarMetrics)
             Toggle(
                 "登录时自动启动",

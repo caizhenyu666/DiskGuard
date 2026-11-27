@@ -172,6 +172,15 @@ echo "==> Assembling DiskGuard.app..."
 cp "$BIN_PATH" "$MACOS_DIR/DiskGuard"
 chmod +x "$MACOS_DIR/DiskGuard"
 
+if [[ -d "$ROOT_DIR/Sources/DiskGuard/Resources/Pets" ]]; then
+  cp -R "$ROOT_DIR/Sources/DiskGuard/Resources/Pets" "$RESOURCES_DIR/Pets"
+fi
+
+BIN_DIR="$(dirname "$BIN_PATH")"
+if [[ -d "$BIN_DIR/DiskGuard_DiskGuard.bundle" ]]; then
+  cp -R "$BIN_DIR/DiskGuard_DiskGuard.bundle" "$RESOURCES_DIR/DiskGuard_DiskGuard.bundle"
+fi
+
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

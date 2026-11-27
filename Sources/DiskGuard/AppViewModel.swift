@@ -182,6 +182,32 @@ public final class AppViewModel: ObservableObject {
             preferences.floatingHUDCollapsed = floatingHUDCollapsed
         }
     }
+    @Published public var floatingHUDMode: FloatingHUDMode = .pet {
+        didSet {
+            guard !isInitializing else { return }
+            preferences.floatingHUDMode = floatingHUDMode
+            let collapsed = (floatingHUDMode == .pill)
+            if floatingHUDCollapsed != collapsed {
+                floatingHUDCollapsed = collapsed
+            }
+        }
+    }
+    @Published public var activePetID: String = PetPack.builtInWestieID {
+        didSet {
+            guard !isInitializing else { return }
+            preferences.activePetID = activePetID
+        }
+    }
+    @Published public var petDisplaySize: PetDisplaySize = .medium {
+        didSet {
+            guard !isInitializing else { return }
+            preferences.petDisplaySize = petDisplaySize
+        }
+    }
+    @Published public var showingPetManagerSheet: Bool = false
+    @Published public var currentPetMood: PetMood = .idle
+    @Published public var petBubbleText: String?
+    public let petAssetStore = PetAssetStore()
     @Published public var showMenuBarExtra: Bool = true {
         didSet {
             guard !isInitializing, showMenuBarExtra != oldValue else { return }
@@ -217,6 +243,9 @@ public final class AppViewModel: ObservableObject {
     private var scanGeneration: UInt64 = 0
     private var streamedByID: [String: ScanItem] = [:]
     private var lastStreamPublish: ContinuousClock.Instant?
+    private var petMoodStabilizer = PetMoodStabilizer()
+    private var petHappyBoostUntil: Date?
+    private var petBubbleDismissTask: Task<Void, Never>?
 
     public init(preferences: UserPreferences = UserPreferences()) {
         let sampler = SystemMonitorSampler()
@@ -231,12 +260,16 @@ public final class AppViewModel: ObservableObject {
         self.floatingHUDAlwaysOn = preferences.floatingHUDAlwaysOn
         self.floatingHUDStyle = preferences.floatingHUDStyle
         self.floatingHUDCollapsed = preferences.floatingHUDCollapsed
+        self.floatingHUDMode = preferences.floatingHUDMode
+        self.activePetID = preferences.activePetID
+        self.petDisplaySize = preferences.petDisplaySize
         self.showMenuBarExtra = preferences.showMenuBarExtra
         self.showMenuBarMetrics = preferences.showMenuBarMetrics
         self.launchAtLogin = (SMAppService.mainApp.status == .enabled)
         self.activeSection = MainSectionTab(rawValue: preferences.activeMainSectionRawValue) ?? .storage
         self.isInitializing = false
         applyAppAppearance()
+        refreshPetMood(now: Date())
     }
 
     public func applyAppAppearance() {
@@ -455,6 +488,9 @@ public final class AppViewModel: ObservableObject {
                 level: .success,
                 message: "清理完成：共将 \(totalTrashed) 项安全移入废纸篓（合计 \(DiskByteFormatter.string(from: totalReclaimed))，跳过 \(totalSkipped) 项）。请在访达「清倒废纸篓」后正式释放空间。"
             )
+            if totalTrashed > 0 {
+                self.triggerPetCleanCelebration(reclaimedBytes: totalReclaimed)
+            }
 
             let affectedURLs = targets.flatMap(\.targets)
             await self.performIncrementalRefresh(affectedPaths: affectedURLs, includeTrash: true)
@@ -675,7 +711,111 @@ public final class AppViewModel: ObservableObject {
     }
 
     public func toggleFloatingHUDCollapsed() {
-        floatingHUDCollapsed.toggle()
+        let next: FloatingHUDMode = (floatingHUDMode == .expanded) ? .pill : .expanded
+        setFloatingHUDMode(next)
+    }
+
+    public func setFloatingHUDMode(_ mode: FloatingHUDMode) {
+        floatingHUDMode = mode
+    }
+
+    public var activePetPack: PetPack? {
+        petAssetStore.pack(for: activePetID)
+    }
+
+    public func selectPet(id: String) {
+        activePetID = id
+        refreshPetMood(now: Date())
+    }
+
+    public var savedFloatingHUDOrigin: CGPoint? {
+        preferences.floatingHUDOrigin
+    }
+
+    public func saveFloatingHUDOrigin(_ origin: CGPoint) {
+        preferences.floatingHUDOrigin = origin
+    }
+
+    public func openPetManager() {
+        showingPetManagerSheet = true
+    }
+
+    public func petInteractionTap() {
+        let now = Date()
+        petHappyBoostUntil = now.addingTimeInterval(4.0)
+        refreshPetMood(now: now)
+
+        let snap = telemetry.snapshot
+        let memPct = Int((snap.memory.usedRatio * 100).rounded())
+        let cpuPct = Int((snap.cpu.totalUsage * 100).rounded())
+        let diskText = DiskByteFormatter.string(from: volumeStats.importantAvailableBytes)
+        let name = activePetPack?.name ?? "西高地"
+        let message = PetMoodEvaluator.bubbleMessage(
+            for: currentPetMood,
+            petName: name,
+            memoryPercent: memPct,
+            cpuPercent: cpuPct,
+            diskAvailableText: diskText,
+            reclaimedText: nil,
+            triggeredByPetting: true
+        )
+        showPetBubble(message, durationSeconds: 2.8)
+    }
+
+    public func triggerPetCleanCelebration(reclaimedBytes: Int64) {
+        let now = Date()
+        petHappyBoostUntil = now.addingTimeInterval(6.0)
+        refreshPetMood(now: now)
+
+        let snap = telemetry.snapshot
+        let memPct = Int((snap.memory.usedRatio * 100).rounded())
+        let cpuPct = Int((snap.cpu.totalUsage * 100).rounded())
+        let diskText = DiskByteFormatter.string(from: volumeStats.importantAvailableBytes)
+        let name = activePetPack?.name ?? "西高地"
+        let reclaimedText = reclaimedBytes > 0 ? DiskByteFormatter.string(from: reclaimedBytes) : nil
+        let message = PetMoodEvaluator.bubbleMessage(
+            for: .happy,
+            petName: name,
+            memoryPercent: memPct,
+            cpuPercent: cpuPct,
+            diskAvailableText: diskText,
+            reclaimedText: reclaimedText,
+            triggeredByPetting: false
+        )
+        showPetBubble(message, durationSeconds: 4.0)
+    }
+
+    private func showPetBubble(_ text: String, durationSeconds: TimeInterval) {
+        petBubbleDismissTask?.cancel()
+        petBubbleText = text
+        petBubbleDismissTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(durationSeconds * 1000)))
+            guard !Task.isCancelled else { return }
+            self?.petBubbleText = nil
+        }
+    }
+
+    private func refreshPetMood(now: Date) {
+        let snap = telemetry.snapshot
+        let comps = Calendar.current.dateComponents([.hour, .minute], from: now)
+        let isHappyBoost = petHappyBoostUntil.map { now < $0 } ?? false
+        let input = PetMoodInput(
+            cpuUsage: snap.cpu.totalUsage,
+            memoryUsedRatio: snap.memory.usedRatio,
+            memoryPressure: snap.memory.pressure,
+            thermal: snap.health.thermal,
+            diskAvailableBytes: volumeStats.importantAvailableBytes,
+            batteryPercent: snap.health.battery?.currentPercent,
+            batteryIsPluggedIn: snap.health.battery?.isPluggedIn ?? true,
+            localHour: comps.hour ?? 12,
+            localMinute: comps.minute ?? 0,
+            isHappyBoostActive: isHappyBoost
+        )
+        let rawMood = PetMoodEvaluator.evaluateRaw(input: input)
+        let nextMood = petMoodStabilizer.update(rawMood: rawMood, now: now)
+        if currentPetMood != nextMood {
+            currentPetMood = nextMood
+        }
     }
 
     public func dismissFloatingHUD() {
@@ -884,6 +1024,7 @@ public final class AppViewModel: ObservableObject {
         self.appendMonitorSample(mergedSnapshot.memory.usedRatio, to: &next.memoryHistory)
         self.appendMonitorSample(mergedSnapshot.health.network.downloadBytesPerSec, to: &next.networkDownHistory)
         self.telemetry = next
+        self.refreshPetMood(now: Date())
     }
 
     public func stopSystemMonitoring() {

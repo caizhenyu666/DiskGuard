@@ -59,15 +59,6 @@ struct MainView: View {
         .onChange(of: viewModel.showMenuBarExtra) { _, newValue in
             AppDelegate.shared?.keepAliveInMenuBar = newValue
         }
-        .onChange(of: viewModel.shouldShowFloatingHUD) { _, _ in
-            floatingController.syncVisibility(viewModel: viewModel)
-        }
-        .onChange(of: viewModel.floatingHUDCollapsed) { _, _ in
-            floatingController.updatePanelSize(viewModel: viewModel)
-        }
-        .onChange(of: viewModel.systemSnapshot.health.vpn.shortBadgeText) { _, _ in
-            floatingController.updatePanelSize(viewModel: viewModel)
-        }
         .alert(
             viewModel.pendingProcessTermination?.title ?? "",
             isPresented: Binding(
@@ -93,6 +84,9 @@ struct MainView: View {
         }
         .sheet(isPresented: $viewModel.showingUpdateSheet) {
             UpdateSheet(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.showingPetManagerSheet) {
+            PetImportSheet(viewModel: viewModel)
         }
         .sheet(item: Binding(
             get: { viewModel.pendingCleanItems.map { CleanSheetPayload(items: $0) } },
@@ -185,7 +179,16 @@ struct MainView: View {
                     Toggle("菜单栏显示实时数值", isOn: $viewModel.showMenuBarMetrics)
                         .disabled(!viewModel.showMenuBarExtra)
                     Divider()
+                    Picker("悬浮窗形态", selection: $viewModel.floatingHUDMode) {
+                        ForEach(FloatingHUDMode.allCases) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                    Button("管理桌宠形象…") {
+                        viewModel.openPetManager()
+                    }
                     Toggle("最小化时自动显示悬浮窗", isOn: $viewModel.floatingHUDOnMinimize)
+                    Divider()
                     Toggle(
                         "登录时自动启动",
                         isOn: Binding(
@@ -207,8 +210,11 @@ struct MainView: View {
     private func appSetupOnAppear() {
         viewModel.applyAppAppearance()
         viewModel.startSystemMonitoring()
+        floatingController.bind(viewModel: viewModel)
         floatingController.onRequestOpenMainWindow = { openWindow(id: "main") }
-        AppDelegate.shared?.onReopenRequest = { openWindow(id: "main") }
+        AppDelegate.shared?.onReopenRequest = { [weak floatingController] in
+            floatingController?.restoreMainWindow()
+        }
         AppDelegate.shared?.keepAliveInMenuBar = viewModel.showMenuBarExtra
         if viewModel.items.isEmpty && !viewModel.isScanning {
             viewModel.startScan()

@@ -9,6 +9,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var onReopenRequest: (() -> Void)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.local.diskguard"
+        let currentPID = NSRunningApplication.current.processIdentifier
+        if let existing = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .first(where: { $0.processIdentifier != currentPID }) {
+            existing.activate(options: [.activateAllWindows])
+            NSApp.terminate(nil)
+            return
+        }
         AppDelegate.shared = self
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -19,10 +27,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag {
-            onReopenRequest?()
-        }
-        return true
+        onReopenRequest?()
+        return false
     }
 }
 
@@ -34,8 +40,12 @@ struct DiskGuardApp: App {
     @AppStorage("diskguard.showMenuBarExtra") private var showMenuBarExtra: Bool = true
     @AppStorage("diskguard.appearanceMode") private var appearanceModeRaw: String = AppearanceMode.system.rawValue
 
+    init() {
+        floatingController.bind(viewModel: viewModel)
+    }
+
     var body: some Scene {
-        WindowGroup("DiskGuard", id: "main") {
+        Window("DiskGuard", id: "main") {
             MainView(viewModel: viewModel, floatingController: floatingController)
                 .frame(minWidth: 920, minHeight: 640)
                 .preferredColorScheme(preferredScheme)

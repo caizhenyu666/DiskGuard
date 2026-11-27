@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import DiskGuardCore
 
 final class FloatingHUDPanel: NSPanel {
@@ -27,6 +28,7 @@ final class FloatingHUDPanel: NSPanel {
 struct FloatingMonitorView: View {
     @ObservedObject var viewModel: AppViewModel
     let onRestoreMainWindow: () -> Void
+    let onOpenPetManager: () -> Void
     @State private var isHovered = false
 
     private var memory: MemoryStats { viewModel.systemSnapshot.memory }
@@ -67,10 +69,19 @@ struct FloatingMonitorView: View {
 
     var body: some View {
         Group {
-            if viewModel.floatingHUDCollapsed {
+            switch viewModel.floatingHUDMode {
+            case .pet:
+                DesktopPetView(viewModel: viewModel, onRestoreMainWindow: onRestoreMainWindow)
+            case .pill:
                 collapsedPillView
-            } else {
+                    .onTapGesture(count: 2) {
+                        onRestoreMainWindow()
+                    }
+            case .expanded:
                 expandedHUDView
+                    .onTapGesture(count: 2) {
+                        onRestoreMainWindow()
+                    }
             }
         }
         .contentShape(Rectangle())
@@ -79,22 +90,45 @@ struct FloatingMonitorView: View {
                 isHovered = hovering
             }
         }
-        .onTapGesture(count: 2) {
-            onRestoreMainWindow()
-        }
         .contextMenu {
             Button("还原 DiskGuard 主窗口") {
                 onRestoreMainWindow()
             }
-            Button(viewModel.floatingHUDCollapsed ? "展开悬浮监控窗" : "收起为迷你胶囊") {
-                viewModel.toggleFloatingHUDCollapsed()
-            }
-            Divider()
-            Picker("背景样式", selection: $viewModel.floatingHUDStyle) {
-                ForEach(FloatingHUDStyle.allCases) { style in
-                    Text(style.displayName).tag(style)
+            Picker("形态", selection: $viewModel.floatingHUDMode) {
+                ForEach(FloatingHUDMode.allCases) { mode in
+                    Text(mode.displayName).tag(mode)
                 }
             }
+            if viewModel.floatingHUDMode == .pet {
+                Picker("大小", selection: $viewModel.petDisplaySize) {
+                    ForEach(PetDisplaySize.allCases) { size in
+                        Text(size.displayName).tag(size)
+                    }
+                }
+                Menu("切换宠物") {
+                    ForEach(viewModel.petAssetStore.availablePacks) { pack in
+                        Button {
+                            viewModel.selectPet(id: pack.id)
+                        } label: {
+                            if viewModel.activePetID == pack.id {
+                                Label(pack.name, systemImage: "checkmark")
+                            } else {
+                                Text(pack.name)
+                            }
+                        }
+                    }
+                }
+                Button("导入 / 管理自定义桌宠…") {
+                    onOpenPetManager()
+                }
+            } else {
+                Picker("背景样式", selection: $viewModel.floatingHUDStyle) {
+                    ForEach(FloatingHUDStyle.allCases) { style in
+                        Text(style.displayName).tag(style)
+                    }
+                }
+            }
+            Divider()
             Toggle("最小化时自动显示", isOn: $viewModel.floatingHUDOnMinimize)
             Toggle("始终钉住悬浮窗", isOn: $viewModel.floatingHUDAlwaysOn)
             Divider()
@@ -148,7 +182,7 @@ struct FloatingMonitorView: View {
             }
 
             Button {
-                viewModel.toggleFloatingHUDCollapsed()
+                viewModel.setFloatingHUDMode(.expanded)
             } label: {
                 Image(systemName: "chevron.down")
                     .font(.system(size: 9.5, weight: .bold))
@@ -227,8 +261,11 @@ struct FloatingMonitorView: View {
                 Spacer()
 
                 HStack(spacing: 4) {
+                    hudIconButton(systemName: "pawprint.fill", help: "切换为桌宠") {
+                        viewModel.setFloatingHUDMode(.pet)
+                    }
                     hudIconButton(systemName: "chevron.up", help: "收起为迷你胶囊") {
-                        viewModel.toggleFloatingHUDCollapsed()
+                        viewModel.setFloatingHUDMode(.pill)
                     }
                     if isHovered {
                         hudIconButton(systemName: "arrow.up.left.and.arrow.down.right", help: "还原主窗口") {
@@ -432,11 +469,63 @@ final class FloatingMonitorController: ObservableObject {
     private var panel: FloatingHUDPanel?
     private weak var hostingView: NSHostingView<FloatingMonitorView>?
     private weak var mainWindow: NSWindow?
+    private weak var boundViewModel: AppViewModel?
     private var observers: [NSObjectProtocol] = []
+    private var cancellables: Set<AnyCancellable> = []
+    private var panelMoveObserver: NSObjectProtocol?
     private var hasPositionedOnce = false
+    private var isProgrammaticFrameUpdate = false
     var onRequestOpenMainWindow: (() -> Void)?
 
+    func bind(viewModel: AppViewModel) {
+        guard boundViewModel !== viewModel else { return }
+        boundViewModel = viewModel
+        cancellables.removeAll()
+
+        Publishers.CombineLatest4(
+            viewModel.$floatingHUDAlwaysOn,
+            viewModel.$floatingHUDOnMinimize,
+            viewModel.$isMainWindowMinimized,
+            viewModel.$hudDismissedForCurrentMinimize
+        )
+        .dropFirst()
+        .sink { [weak self, weak viewModel] _ in
+            Task { @MainActor [weak self, weak viewModel] in
+                guard let self, let viewModel else { return }
+                self.syncVisibility(viewModel: viewModel)
+            }
+        }
+        .store(in: &cancellables)
+
+        Publishers.CombineLatest3(
+            viewModel.$floatingHUDMode,
+            viewModel.$floatingHUDCollapsed,
+            viewModel.$petDisplaySize
+        )
+        .dropFirst()
+        .sink { [weak self, weak viewModel] _ in
+            Task { @MainActor [weak self, weak viewModel] in
+                guard let self, let viewModel else { return }
+                self.updatePanelSize(viewModel: viewModel)
+            }
+        }
+        .store(in: &cancellables)
+
+        viewModel.$telemetry
+            .map(\.snapshot.health.vpn.shortBadgeText)
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self, weak viewModel] _ in
+                Task { @MainActor [weak self, weak viewModel] in
+                    guard let self, let viewModel else { return }
+                    self.updatePanelSize(viewModel: viewModel)
+                }
+            }
+            .store(in: &cancellables)
+    }
+
     func attach(mainWindow: NSWindow, viewModel: AppViewModel) {
+        bind(viewModel: viewModel)
         if self.mainWindow === mainWindow {
             syncVisibility(viewModel: viewModel)
             return
@@ -465,6 +554,12 @@ final class FloatingMonitorController: ObservableObject {
                 guard let self else { return }
                 self.detachObservers()
                 self.mainWindow = nil
+                viewModel?.setMainWindowMinimized(false)
+                if let viewModel, !viewModel.showMenuBarExtra {
+                    self.teardownPanel()
+                    NSApp.terminate(nil)
+                    return
+                }
                 if let viewModel, !viewModel.shouldShowFloatingHUD {
                     self.panel?.orderOut(nil)
                 }
@@ -480,7 +575,11 @@ final class FloatingMonitorController: ObservableObject {
         if viewModel.shouldShowFloatingHUD {
             let panel = ensurePanel(viewModel: viewModel)
             if !hasPositionedOnce {
-                positionTopRight(panel)
+                if let saved = viewModel.savedFloatingHUDOrigin {
+                    position(panel, at: saved)
+                } else {
+                    positionTopRight(panel)
+                }
                 hasPositionedOnce = true
             } else {
                 updatePanelSize(viewModel: viewModel)
@@ -512,7 +611,9 @@ final class FloatingMonitorController: ObservableObject {
             newY = min(max(visible.minY + 8, newY), visible.maxY - newSize.height - 8)
         }
 
+        isProgrammaticFrameUpdate = true
         panel.setFrame(NSRect(origin: NSPoint(x: newX, y: newY), size: newSize), display: true)
+        isProgrammaticFrameUpdate = false
     }
 
     func restoreMainWindow() {
@@ -528,6 +629,10 @@ final class FloatingMonitorController: ObservableObject {
     }
 
     func teardownPanel() {
+        if let panelMoveObserver {
+            NotificationCenter.default.removeObserver(panelMoveObserver)
+            self.panelMoveObserver = nil
+        }
         panel?.orderOut(nil)
         panel?.close()
         panel = nil
@@ -542,18 +647,58 @@ final class FloatingMonitorController: ObservableObject {
         let initialRect = NSRect(x: 0, y: 0, width: 254, height: 142)
         let newPanel = FloatingHUDPanel(contentRect: initialRect)
         let newHostingView = NSHostingView(
-            rootView: FloatingMonitorView(viewModel: viewModel) { [weak self] in
-                self?.restoreMainWindow()
-            }
+            rootView: FloatingMonitorView(
+                viewModel: viewModel,
+                onRestoreMainWindow: { [weak self] in
+                    self?.restoreMainWindow()
+                },
+                onOpenPetManager: { [weak self, weak viewModel] in
+                    self?.restoreMainWindow()
+                    viewModel?.openPetManager()
+                }
+            )
         )
         newHostingView.wantsLayer = true
         newHostingView.layer?.backgroundColor = NSColor.clear.cgColor
         newPanel.contentView = newHostingView
         newHostingView.layoutSubtreeIfNeeded()
         newPanel.setContentSize(newHostingView.fittingSize)
+
+        panelMoveObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification,
+            object: newPanel,
+            queue: .main
+        ) { [weak self, weak newPanel, weak viewModel] _ in
+            Task { @MainActor [weak self, weak newPanel, weak viewModel] in
+                guard let self, let newPanel, let viewModel,
+                      !self.isProgrammaticFrameUpdate,
+                      self.hasPositionedOnce else {
+                    return
+                }
+                viewModel.saveFloatingHUDOrigin(newPanel.frame.origin)
+            }
+        }
+
         self.panel = newPanel
         self.hostingView = newHostingView
         return newPanel
+    }
+
+    private func position(_ panel: NSPanel, at origin: CGPoint) {
+        let size = panel.frame.size
+        let screens = NSScreen.screens
+        let matchingScreen = screens.first { $0.visibleFrame.intersects(NSRect(origin: origin, size: size)) }
+            ?? mainWindow?.screen ?? NSScreen.main ?? screens.first
+        guard let screen = matchingScreen else {
+            panel.setFrameOrigin(origin)
+            return
+        }
+        let visible = screen.visibleFrame
+        let x = min(max(visible.minX + 8, origin.x), visible.maxX - size.width - 8)
+        let y = min(max(visible.minY + 8, origin.y), visible.maxY - size.height - 8)
+        isProgrammaticFrameUpdate = true
+        panel.setFrameOrigin(NSPoint(x: x, y: y))
+        isProgrammaticFrameUpdate = false
     }
 
     private func positionTopRight(_ panel: NSPanel) {
@@ -562,7 +707,9 @@ final class FloatingMonitorController: ObservableObject {
         let size = panel.frame.size
         let x = visible.maxX - size.width - 16
         let y = visible.maxY - size.height - 12
+        isProgrammaticFrameUpdate = true
         panel.setFrameOrigin(NSPoint(x: x, y: y))
+        isProgrammaticFrameUpdate = false
     }
 
     private func detachObservers() {
