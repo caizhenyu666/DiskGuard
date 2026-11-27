@@ -1,0 +1,772 @@
+import SwiftUI
+import DiskGuardCore
+
+struct MainView: View {
+    @ObservedObject var viewModel: AppViewModel
+    @State private var hoveredID: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            headerSection
+                .padding(.horizontal, 24)
+                .padding(.top, 20)
+                .padding(.bottom, 14)
+
+            Divider()
+
+            toolbarSection
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
+
+            Divider()
+
+            contentListSection
+
+            Divider()
+
+            bottomDrawerSection
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear {
+            viewModel.applyAppAppearance()
+            if viewModel.items.isEmpty && !viewModel.isScanning {
+                viewModel.startScan()
+            }
+        }
+        .sheet(item: Binding(
+            get: { viewModel.pendingCleanItems.map { CleanSheetPayload(items: $0) } },
+            set: { if $0 == nil { viewModel.cancelPendingClean() } }
+        )) { payload in
+            ConfirmCleanSheet(
+                items: payload.items,
+                onCancel: { viewModel.cancelPendingClean() },
+                onConfirm: { viewModel.executePendingClean() }
+            )
+        }
+        .sheet(item: $viewModel.activeBrowser) { context in
+            DirectoryBrowserView(context: context, mainViewModel: viewModel)
+        }
+    }
+
+    // MARK: - Header & Capacity Bar
+
+    private var headerSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                HStack(spacing: 12) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(
+                                LinearGradient(
+                                    colors: [Color.accentColor.opacity(0.9), Color.teal],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                            .frame(width: 38, height: 38)
+                        Image(systemName: "externaldrive.badge.checkmark")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(.white)
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("DiskGuard · macOS 存储管理")
+                            .font(.system(size: 18, weight: .semibold))
+                        Text("只清理可重建缓存与明确确认的残留，默认移入废纸篓，绝不动你的文档与代码")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer()
+
+                VStack(alignment: .trailing, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Text("可用")
+                            .foregroundStyle(.secondary)
+                        Text(DiskByteFormatter.string(from: viewModel.volumeStats.importantAvailableBytes))
+                            .fontWeight(.semibold)
+                            .foregroundStyle(viewModel.volumeStats.importantAvailableBytes < 20_000_000_000 ? .orange : .primary)
+                        Text("/ 共 \(DiskByteFormatter.string(from: viewModel.volumeStats.totalBytes))")
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.system(size: 13).monospacedDigit())
+
+                    if viewModel.volumeStats.purgeableBytes > 1_000_000_000 {
+                        Text("物理空闲 \(DiskByteFormatter.string(from: viewModel.volumeStats.physicalAvailableBytes)) · 含系统可清除空间 \(DiskByteFormatter.string(from: viewModel.volumeStats.purgeableBytes))")
+                            .font(.system(size: 11).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            capacityBarCard
+
+            if case .missing(let blocked) = viewModel.fdaStatus {
+                fdaBanner(blockedPaths: blocked)
+            }
+        }
+    }
+
+    private var capacityBarCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                HStack(spacing: 14) {
+                    legendDot(color: .orange, text: "已用 \(DiskByteFormatter.string(from: viewModel.volumeStats.usedBytes))")
+                    if viewModel.selectedBytes > 0 {
+                        legendDot(color: .green, text: "已选可移入废纸篓 \(DiskByteFormatter.string(from: viewModel.selectedBytes))")
+                    }
+                }
+                .font(.system(size: 12).monospacedDigit())
+
+                Spacer()
+
+                if viewModel.selectedBytes > 0 {
+                    Text("清倒废纸篓后预计可用 \(DiskByteFormatter.string(from: viewModel.volumeStats.importantAvailableBytes)) → \(DiskByteFormatter.string(from: viewModel.projectedAvailableBytes))")
+                        .font(.system(size: 12, weight: .medium).monospacedDigit())
+                        .foregroundStyle(.green)
+                } else {
+                    Text("勾选下方项目可实时预览释放效果")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            GeometryReader { geo in
+                let total = max(1, Double(viewModel.volumeStats.totalBytes))
+                let selectedFrac = min(Double(viewModel.selectedBytes) / total, Double(viewModel.volumeStats.usedBytes) / total)
+                let remainingUsedFrac = max(0, Double(viewModel.volumeStats.usedBytes) / total - selectedFrac)
+
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.primary.opacity(0.08))
+
+                    HStack(spacing: 1) {
+                        if remainingUsedFrac > 0 {
+                            Rectangle()
+                                .fill(
+                                    LinearGradient(
+                                        colors: [Color.orange.opacity(0.9), Color.orange.opacity(0.75)],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                )
+                                .frame(width: max(2, geo.size.width * remainingUsedFrac))
+                        }
+
+                        if selectedFrac > 0 {
+                            Rectangle()
+                                .fill(Color.green)
+                                .frame(width: max(4, geo.size.width * selectedFrac))
+                        }
+                    }
+                    .clipShape(Capsule())
+                    .animation(.easeInOut(duration: 0.25), value: viewModel.selectedBytes)
+                }
+            }
+            .frame(height: 12)
+        }
+        .padding(12)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private func legendDot(color: Color, text: String) -> some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            Text(text)
+        }
+    }
+
+    private func fdaBanner(blockedPaths: [String]) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.shield.fill")
+                .foregroundStyle(.orange)
+                .font(.system(size: 15))
+            VStack(alignment: .leading, spacing: 1) {
+                Text("部分受保护目录未获授权扫描：\(blockedPaths.joined(separator: "、"))")
+                    .font(.system(size: 12, weight: .medium))
+                Text("如需扫描下载安装包、Application Support 与废纸篓占用，请在系统设置开启「完全磁盘访问权限」")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("前往系统设置") {
+                viewModel.openFullDiskAccessSettings()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Button("已授权，重扫") {
+                viewModel.startScan()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.1))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.orange.opacity(0.3), lineWidth: 1)
+        )
+    }
+
+    // MARK: - Toolbar
+
+    private var toolbarSection: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                ForEach(FilterTab.allCases) { tab in
+                    let isSelected = viewModel.activeFilter == tab
+                    Button {
+                        viewModel.activeFilter = tab
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text(tab.title)
+                            Text("\(viewModel.count(for: tab))")
+                                .font(.system(size: 11).monospacedDigit())
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(isSelected ? Color.white.opacity(0.22) : Color.primary.opacity(0.08))
+                                .clipShape(Capsule())
+                        }
+                        .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(isSelected ? Color.accentColor : Color.primary.opacity(0.05))
+                        .foregroundStyle(isSelected ? .white : .primary)
+                        .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Spacer()
+
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                        .font(.system(size: 12))
+                    TextField("搜索名称或路径...", text: $viewModel.searchText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12))
+                        .frame(width: 180)
+                    if !viewModel.searchText.isEmpty {
+                        Button {
+                            viewModel.searchText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(Color(nsColor: .controlBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
+                )
+            }
+
+            HStack(spacing: 8) {
+                Button("全选安全项") {
+                    viewModel.selectAllSafe()
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.isScanning || viewModel.isCleaning)
+
+                Button("全不选") {
+                    viewModel.deselectAll()
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.selectedIDs.isEmpty || viewModel.isCleaning)
+
+                Spacer()
+
+                Button {
+                    viewModel.appearanceMode = viewModel.appearanceMode.next
+                } label: {
+                    Label(viewModel.appearanceMode.displayName, systemImage: appearanceIcon)
+                }
+                .buttonStyle(.bordered)
+                .help("切换外观模式（自动 / 浅色 / 深色）")
+
+                Button {
+                    viewModel.startScan()
+                } label: {
+                    Label(viewModel.isScanning ? "扫描中..." : "重新扫描", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.isScanning || viewModel.isCleaning)
+
+                Button {
+                    viewModel.requestCleanSelected()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "trash")
+                        if viewModel.selectedBytes > 0 {
+                            Text("移至废纸篓 · \(DiskByteFormatter.string(from: viewModel.selectedBytes))")
+                                .monospacedDigit()
+                        } else {
+                            Text("移至废纸篓")
+                        }
+                    }
+                    .fontWeight(.semibold)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.accentColor)
+                .disabled(viewModel.selectedItems.isEmpty || viewModel.isScanning || viewModel.isCleaning)
+            }
+        }
+    }
+
+    private var appearanceIcon: String {
+        switch viewModel.appearanceMode {
+        case .system: return "circle.lefthalf.filled"
+        case .light: return "sun.max"
+        case .dark: return "moon"
+        }
+    }
+
+    // MARK: - Content List
+
+    private var contentListSection: some View {
+        let visibleTiers: [RiskTier] = viewModel.activeFilter.tier.map { [$0] } ?? RiskTier.allCases
+        let hasAnyVisible = visibleTiers.contains { !viewModel.items(for: $0).isEmpty }
+
+        return Group {
+            if viewModel.isScanning && viewModel.items.isEmpty {
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .controlSize(.large)
+                    Text(viewModel.scanProgressText)
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if !hasAnyVisible {
+                VStack(spacing: 10) {
+                    Image(systemName: "checkmark.circle")
+                        .font(.system(size: 32))
+                        .foregroundStyle(.secondary)
+                    Text(viewModel.searchText.isEmpty ? "当前分类暂无发现可展示项目" : "没有匹配「\(viewModel.searchText)」的项目")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 14) {
+                        ForEach(visibleTiers) { tier in
+                            let tierItems = viewModel.items(for: tier)
+                            if !tierItems.isEmpty {
+                                tierSectionView(tier: tier, tierItems: tierItems)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 14)
+                }
+            }
+        }
+    }
+
+    private func tierSectionView(tier: RiskTier, tierItems: [ScanItem]) -> some View {
+        let isCollapsed = viewModel.collapsedTiers.contains(tier)
+        let tierTotal = viewModel.totalBytes(for: tier)
+
+        return VStack(spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    viewModel.toggleSection(tier)
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 14)
+
+                    Circle()
+                        .fill(tierColor(tier))
+                        .frame(width: 8, height: 8)
+
+                    Text(tier.displayName)
+                        .font(.system(size: 13, weight: .semibold))
+
+                    Text("· \(tier.sectionSubtitle)")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+
+                    Spacer()
+
+                    Text("\(tierItems.count) 项")
+                        .font(.system(size: 11).monospacedDigit())
+                        .foregroundStyle(.secondary)
+
+                    Text(DiskByteFormatter.string(from: tierTotal))
+                        .font(.system(size: 13, weight: .semibold).monospacedDigit())
+                        .frame(minWidth: 74, alignment: .trailing)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .background(Color(nsColor: .controlBackgroundColor))
+
+            if !isCollapsed {
+                Divider()
+                VStack(spacing: 0) {
+                    ForEach(tierItems) { item in
+                        itemRow(item)
+                        if item.id != tierItems.last?.id {
+                            Divider().padding(.leading, 44)
+                        }
+                    }
+                }
+            }
+        }
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private func itemRow(_ item: ScanItem) -> some View {
+        let isSelected = viewModel.selectedIDs.contains(item.id)
+        let isHovered = hoveredID == item.id
+        let sizeRatio = Double(item.sizeBytes) / Double(viewModel.maxVisibleSizeBytes)
+
+        return HStack(spacing: 10) {
+            if item.isSelectable {
+                Toggle("", isOn: Binding(
+                    get: { isSelected },
+                    set: { _ in viewModel.toggleSelection(id: item.id) }
+                ))
+                .toggleStyle(.checkbox)
+                .labelsHidden()
+                .frame(width: 20)
+            } else {
+                Image(systemName: item.lockReason != nil ? "lock.fill" : "eye")
+                    .font(.system(size: 11))
+                    .foregroundStyle(item.lockReason != nil ? .orange : .secondary)
+                    .frame(width: 20)
+            }
+
+            Image(systemName: item.categoryIcon)
+                .font(.system(size: 13))
+                .foregroundStyle(tierColor(item.tier))
+                .frame(width: 26, height: 26)
+                .background(tierColor(item.tier).opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(item.title)
+                        .font(.system(size: 13, weight: .medium))
+                        .lineLimit(1)
+
+                    if let warn = item.runningAppWarning {
+                        pillLabel(warn, color: .orange)
+                    }
+                    if let lock = item.lockReason {
+                        pillLabel(lock, color: .red)
+                    }
+                }
+
+                HStack(spacing: 6) {
+                    Text(item.subtitle)
+                        .lineLimit(1)
+                    Text("·")
+                    Text(DiskByteFormatter.compactPath(item.displayPathURL))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 12)
+
+            if isHovered {
+                HStack(spacing: 4) {
+                    if viewModel.canBrowseInApp(item) {
+                        Button {
+                            viewModel.openFolderInApp(item)
+                        } label: {
+                            Image(systemName: "arrow.right.circle")
+                                .font(.system(size: 11))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .help(item.id == "tier3.trash" ? "在应用内管理废纸篓" : "在应用内打开下一级")
+                    }
+
+                    Button {
+                        viewModel.revealInFinder(item)
+                    } label: {
+                        Image(systemName: "folder")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .help("在 Finder 中显示")
+
+                    if item.isSelectable {
+                        Button {
+                            viewModel.requestCleanSingle(item)
+                        } label: {
+                            Image(systemName: "trash")
+                                .font(.system(size: 11))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .help("单独移至废纸篓")
+                    }
+                }
+            }
+
+            ZStack(alignment: .trailing) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(tierColor(item.tier).opacity(0.14))
+                    .frame(width: max(4, 70 * sizeRatio), height: 6)
+            }
+            .frame(width: 70, alignment: .trailing)
+
+            Text(item.sizeBytes > 0 ? DiskByteFormatter.string(from: item.sizeBytes) : "提示")
+                .font(.system(size: 12.5, weight: .medium).monospacedDigit())
+                .frame(width: 78, alignment: .trailing)
+
+            Text(item.tier.badgeText)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(tierColor(item.tier))
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(tierColor(item.tier).opacity(0.12))
+                .clipShape(Capsule())
+                .frame(width: 58, alignment: .center)
+
+            if viewModel.canBrowseInApp(item) {
+                Button {
+                    viewModel.openFolderInApp(item)
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .frame(width: 14)
+                .help(item.id == "tier3.trash" ? "在应用内打开废纸篓" : "打开下一级")
+            } else {
+                Spacer()
+                    .frame(width: 14)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(isSelected ? Color.accentColor.opacity(0.06) : (isHovered ? Color.primary.opacity(0.03) : Color.clear))
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            hoveredID = hovering ? item.id : (hoveredID == item.id ? nil : hoveredID)
+        }
+        .onTapGesture(count: 2) {
+            if viewModel.canBrowseInApp(item) {
+                viewModel.openFolderInApp(item)
+            }
+        }
+        .onTapGesture(count: 1) {
+            if item.isSelectable {
+                viewModel.toggleSelection(id: item.id)
+            } else if viewModel.canBrowseInApp(item) {
+                viewModel.openFolderInApp(item)
+            }
+        }
+        .contextMenu {
+            if viewModel.canBrowseInApp(item) {
+                Button {
+                    viewModel.openFolderInApp(item)
+                } label: {
+                    Label(item.id == "tier3.trash" ? "在应用内管理废纸篓" : "在应用内打开下一级", systemImage: "arrow.right.circle")
+                }
+                Divider()
+            }
+
+            Button {
+                viewModel.revealInFinder(item)
+            } label: {
+                Label("在 Finder 中显示", systemImage: "folder")
+            }
+
+            Button {
+                viewModel.copyPath(item)
+            } label: {
+                Label("复制完整路径", systemImage: "doc.on.doc")
+            }
+
+            if item.isSelectable {
+                Divider()
+                Button {
+                    viewModel.requestCleanSingle(item)
+                } label: {
+                    Label("单独移至废纸篓", systemImage: "trash")
+                }
+            }
+        }
+    }
+
+    private func pillLabel(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 10, weight: .medium))
+            .foregroundStyle(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1)
+            .background(color.opacity(0.12))
+            .clipShape(Capsule())
+    }
+
+    private func tierColor(_ tier: RiskTier) -> Color {
+        switch tier {
+        case .safe: return .green
+        case .caution: return .orange
+        case .readOnly: return .secondary
+        }
+    }
+
+    // MARK: - Bottom Drawer
+
+    private var bottomDrawerSection: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                if viewModel.isCleaning {
+                    ProgressView(value: viewModel.cleanProgress)
+                        .frame(width: 120)
+                    Text("正在安全移入废纸篓...")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                } else if viewModel.isScanning {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(viewModel.scanProgressText)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("\(viewModel.scanProgressText) · 已选 \(viewModel.selectedItems.count) 项（\(DiskByteFormatter.string(from: viewModel.selectedBytes))）")
+                        .font(.system(size: 12).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Button {
+                    viewModel.openTrashInApp()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "trash")
+                        if viewModel.trashBytes > 0 {
+                            Text("管理废纸篓 (\(DiskByteFormatter.string(from: viewModel.trashBytes)))")
+                                .monospacedDigit()
+                        } else {
+                            Text("管理废纸篓")
+                        }
+                    }
+                    .font(.system(size: 11.5))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        viewModel.isLogDrawerExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: viewModel.isLogDrawerExpanded ? "chevron.down" : "chevron.up")
+                        Text("清理日志 (\(viewModel.logs.count))")
+                            .monospacedDigit()
+                    }
+                    .font(.system(size: 11.5))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 9)
+            .background(Color(nsColor: .controlBackgroundColor))
+
+            if viewModel.isLogDrawerExpanded {
+                Divider()
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 4) {
+                            if viewModel.logs.isEmpty {
+                                Text("清理日志会显示在这里，右键任意项目可快速在 Finder 中定位或单独清理")
+                                    .font(.system(size: 11.5))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.vertical, 8)
+                            } else {
+                                ForEach(viewModel.logs) { log in
+                                    HStack(alignment: .top, spacing: 8) {
+                                        Text(Self.timeFormatter.string(from: log.timestamp))
+                                            .font(.system(size: 11, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                        Circle()
+                                            .fill(logColor(log.level))
+                                            .frame(width: 6, height: 6)
+                                            .padding(.top, 4)
+                                        Text(log.message)
+                                            .font(.system(size: 11.5))
+                                            .textSelection(.enabled)
+                                    }
+                                    .id(log.id)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 8)
+                    }
+                    .frame(height: 135)
+                    .background(Color(nsColor: .textBackgroundColor))
+                    .onChange(of: viewModel.logs.count) { _, _ in
+                        if let last = viewModel.logs.last {
+                            proxy.scrollTo(last.id, anchor: .bottom)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func logColor(_ level: LogLevel) -> Color {
+        switch level {
+        case .info: return .secondary
+        case .success: return .green
+        case .warning: return .orange
+        case .error: return .red
+        }
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+}
+
+private struct CleanSheetPayload: Identifiable {
+    let id = UUID()
+    let items: [ScanItem]
+}
