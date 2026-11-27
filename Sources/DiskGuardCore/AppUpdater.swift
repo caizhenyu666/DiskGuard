@@ -486,6 +486,70 @@ public final class AppUpdater: Sendable {
         }
     }
 
+    public static func helperScriptContent() -> String {
+        """
+        #!/bin/sh
+        set -eu
+        PID="$1"
+        TARGET_APP="$2"
+        STAGED_APP="$3"
+        TEMP_DIR="$4"
+        BACKUP_APP="${TARGET_APP}.backup.$$"
+
+        # Wait up to 5 seconds for current DiskGuard process to exit gracefully
+        i=0
+        while kill -0 "$PID" 2>/dev/null; do
+            i=$((i + 1))
+            if [ "$i" -ge 50 ]; then
+                break
+            fi
+            sleep 0.1
+        done
+
+        # Fall back to SIGTERM if still alive
+        if kill -0 "$PID" 2>/dev/null; then
+            kill -TERM "$PID" 2>/dev/null || true
+            j=0
+            while kill -0 "$PID" 2>/dev/null; do
+                j=$((j + 1))
+                if [ "$j" -ge 30 ]; then
+                    break
+                fi
+                sleep 0.1
+            done
+        fi
+
+        # Fall back to SIGKILL if still stuck
+        if kill -0 "$PID" 2>/dev/null; then
+            kill -KILL "$PID" 2>/dev/null || true
+            k=0
+            while kill -0 "$PID" 2>/dev/null; do
+                k=$((k + 1))
+                if [ "$k" -ge 10 ]; then
+                    break
+                fi
+                sleep 0.1
+            done
+        fi
+
+        if [ -e "$TARGET_APP" ]; then
+            mv "$TARGET_APP" "$BACKUP_APP"
+        fi
+
+        if mv "$STAGED_APP" "$TARGET_APP"; then
+            xattr -dr com.apple.quarantine "$TARGET_APP" 2>/dev/null || true
+            rm -rf "$BACKUP_APP" "$TEMP_DIR"
+            open "$TARGET_APP"
+            exit 0
+        else
+            if [ -e "$BACKUP_APP" ] && [ ! -e "$TARGET_APP" ]; then
+                mv "$BACKUP_APP" "$TARGET_APP" || true
+            fi
+            exit 1
+        fi
+        """
+    }
+
     public func installAndRelaunch(
         prepared: PreparedUpdate,
         targetAppURL: URL = Bundle.main.bundleURL
@@ -500,41 +564,7 @@ public final class AppUpdater: Sendable {
         }
 
         let scriptURL = prepared.tempDirectory.appendingPathComponent("apply-update.sh")
-        let scriptContent = """
-        #!/bin/sh
-        set -eu
-        PID="$1"
-        TARGET_APP="$2"
-        STAGED_APP="$3"
-        TEMP_DIR="$4"
-        BACKUP_APP="${TARGET_APP}.backup.$$"
-
-        # Wait up to 15 seconds for current DiskGuard process to exit
-        i=0
-        while kill -0 "$PID" 2>/dev/null; do
-            i=$((i + 1))
-            if [ "$i" -ge 150 ]; then
-                break
-            fi
-            sleep 0.1
-        done
-
-        if [ -e "$TARGET_APP" ]; then
-            mv "$TARGET_APP" "$BACKUP_APP"
-        fi
-
-        if mv "$STAGED_APP" "$TARGET_APP"; then
-            xattr -dr com.apple.quarantine "$TARGET_APP" 2>/dev/null || true
-            rm -rf "$BACKUP_APP" "$TEMP_DIR"
-            open -n "$TARGET_APP"
-            exit 0
-        else
-            if [ -e "$BACKUP_APP" ] && [ ! -e "$TARGET_APP" ]; then
-                mv "$BACKUP_APP" "$TARGET_APP" || true
-            fi
-            exit 1
-        fi
-        """
+        let scriptContent = Self.helperScriptContent()
 
         do {
             try scriptContent.write(to: scriptURL, atomically: true, encoding: .utf8)

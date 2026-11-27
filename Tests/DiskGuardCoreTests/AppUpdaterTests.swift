@@ -92,4 +92,16 @@ struct AppUpdaterTests {
         #expect(AppUpdater.parseSHA256Text("not-a-sha256") == nil)
         #expect(AppUpdater.parseSHA256Text("abcd1234  DiskGuard-v1.2.0.zip") == nil)
     }
+
+    @Test("helperScriptContent waits for PID, escalates to TERM/KILL if stuck, swaps atomically, and launches without -n")
+    func helperScriptContentBehavior() {
+        let script = AppUpdater.helperScriptContent()
+        #expect(script.contains("kill -0 \"$PID\""))
+        #expect(script.contains("kill -TERM \"$PID\""))
+        #expect(script.contains("kill -KILL \"$PID\""))
+        #expect(script.contains("mv \"$TARGET_APP\" \"$BACKUP_APP\""))
+        #expect(script.contains("mv \"$STAGED_APP\" \"$TARGET_APP\""))
+        #expect(script.contains("open \"$TARGET_APP\""))
+        #expect(!script.contains("open -n "))
+    }
 }

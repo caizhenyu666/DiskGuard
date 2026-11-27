@@ -533,7 +533,18 @@ public final class AppViewModel: ObservableObject {
                 self.updateState = .downloading(release, "验证通过，正在替换并重启...")
                 try updater.installAndRelaunch(prepared: prepared, targetAppURL: Bundle.main.bundleURL)
                 self.appendLog(level: .success, message: "正在重启并升级至 \(release.tagName)...")
+                self.showingUpdateSheet = false
+                self.scanTask?.cancel()
+                self.refreshTask?.cancel()
+                self.stopSystemMonitoring()
+                for window in NSApp.windows {
+                    window.orderOut(nil)
+                    window.close()
+                }
                 NSApp.terminate(nil)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    exit(0)
+                }
             } catch {
                 if Task.isCancelled { return }
                 let msg = error.localizedDescription
