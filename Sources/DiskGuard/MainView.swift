@@ -32,6 +32,10 @@ struct MainView: View {
             if viewModel.items.isEmpty && !viewModel.isScanning {
                 viewModel.startScan()
             }
+            viewModel.checkForUpdatesOnLaunchIfNeeded()
+        }
+        .sheet(isPresented: $viewModel.showingUpdateSheet) {
+            UpdateSheet(viewModel: viewModel)
         }
         .sheet(item: Binding(
             get: { viewModel.pendingCleanItems.map { CleanSheetPayload(items: $0) } },
@@ -70,8 +74,11 @@ struct MainView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("DiskGuard · macOS 存储管理")
-                            .font(.system(size: 18, weight: .semibold))
+                        HStack(spacing: 8) {
+                            Text("DiskGuard · macOS 存储管理")
+                                .font(.system(size: 18, weight: .semibold))
+                            versionPill
+                        }
                         Text("只清理可重建缓存与明确确认的残留，默认移入废纸篓，绝不动你的文档与代码")
                             .font(.system(size: 12))
                             .foregroundStyle(.secondary)
@@ -293,6 +300,8 @@ struct MainView: View {
 
                 Spacer()
 
+                updateToolbarButton
+
                 Button {
                     viewModel.appearanceMode = viewModel.appearanceMode.next
                 } label: {
@@ -335,6 +344,73 @@ struct MainView: View {
         case .system: return "circle.lefthalf.filled"
         case .light: return "sun.max"
         case .dark: return "moon"
+        }
+    }
+
+    @ViewBuilder
+    private var versionPill: some View {
+        let hasUpdate: Bool = {
+            if case .available = viewModel.updateState { return true }
+            return false
+        }()
+
+        Button {
+            viewModel.handleVersionBadgeTap()
+        } label: {
+            HStack(spacing: 4) {
+                if hasUpdate {
+                    Circle()
+                        .fill(.green)
+                        .frame(width: 6, height: 6)
+                }
+                Text(viewModel.currentVersion.displayTag)
+                    .font(.system(size: 11, weight: .medium).monospacedDigit())
+            }
+            .foregroundStyle(hasUpdate ? Color.green : Color.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(hasUpdate ? Color.green.opacity(0.14) : Color.primary.opacity(0.06))
+            .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("当前版本 \(viewModel.currentVersion.displayTag) (Build \(viewModel.currentBuildNumber)) · 点击检查更新")
+    }
+
+    @ViewBuilder
+    private var updateToolbarButton: some View {
+        switch viewModel.updateState {
+        case .available(let release):
+            Button {
+                viewModel.showingUpdateSheet = true
+            } label: {
+                Label("更新至 \(release.tagName)", systemImage: "arrow.down.circle.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
+            .help("发现新版本 \(release.tagName)，点击查看并更新")
+
+        case .downloading:
+            Button {} label: {
+                Label("正在更新...", systemImage: "arrow.down.circle")
+            }
+            .buttonStyle(.bordered)
+            .disabled(true)
+
+        case .checking:
+            Button {} label: {
+                Label("检查中...", systemImage: "arrow.triangle.2.circlepath")
+            }
+            .buttonStyle(.bordered)
+            .disabled(true)
+
+        case .idle, .upToDate, .failed:
+            Button {
+                viewModel.checkForUpdates(silent: false)
+            } label: {
+                Label("检查更新", systemImage: "arrow.triangle.2.circlepath")
+            }
+            .buttonStyle(.bordered)
+            .help("检查 GitHub Releases 最新版本")
         }
     }
 

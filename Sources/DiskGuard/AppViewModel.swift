@@ -30,6 +30,15 @@ public enum FilterTab: String, CaseIterable, Identifiable {
     }
 }
 
+public enum UpdateState: Equatable {
+    case idle
+    case checking
+    case upToDate(SemVer)
+    case available(ReleaseInfo)
+    case downloading(ReleaseInfo, String)
+    case failed(String)
+}
+
 @MainActor
 public final class AppViewModel: ObservableObject {
     @Published public var volumeStats: VolumeStats = DiskScanner.readVolumeStats()
@@ -64,6 +73,8 @@ public final class AppViewModel: ObservableObject {
     }
     @Published public var pendingCleanItems: [ScanItem]?
     @Published public var activeBrowser: BrowserContext?
+    @Published public var updateState: UpdateState = .idle
+    @Published public var showingUpdateSheet: Bool = false
     @Published public var collapsedTiers: Set<RiskTier> = [] {
         didSet {
             guard !isInitializing else { return }
@@ -72,11 +83,15 @@ public final class AppViewModel: ObservableObject {
     }
 
     public let sizeCache = DirectorySizeCache()
+    public let currentVersion: SemVer = AppUpdater.currentAppVersion()
+    public let currentBuildNumber: String = AppUpdater.currentBuildNumber()
 
     private let preferences: UserPreferences
     private var isInitializing = true
     private var scanTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
+    private var updateTask: Task<Void, Never>?
+    private var hasAutoCheckedUpdate = false
     private var scanGeneration: UInt64 = 0
     private var streamedByID: [String: ScanItem] = [:]
     private var lastStreamPublish: ContinuousClock.Instant?
@@ -403,6 +418,98 @@ public final class AppViewModel: ObservableObject {
     public func openFullDiskAccessSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    // MARK: - App Updates
+
+    public func checkForUpdatesOnLaunchIfNeeded() {
+        guard !hasAutoCheckedUpdate else { return }
+        hasAutoCheckedUpdate = true
+        checkForUpdates(silent: true)
+    }
+
+    public func handleVersionBadgeTap() {
+        if case .available = updateState {
+            showingUpdateSheet = true
+        } else {
+            checkForUpdates(silent: false)
+        }
+    }
+
+    public func checkForUpdates(silent: Bool = false) {
+        if case .downloading = updateState { return }
+        updateTask?.cancel()
+        if !silent {
+            updateState = .checking
+        }
+
+        let current = currentVersion
+        updateTask = Task {
+            let updater = AppUpdater()
+            do {
+                let outcome = try await updater.checkForUpdates(currentVersion: current)
+                if Task.isCancelled { return }
+                switch outcome {
+                case .updateAvailable(_, let release):
+                    self.updateState = .available(release)
+                    self.appendLog(level: .info, message: "发现 DiskGuard 新版本 \(release.tagName)（当前 \(current.displayTag)）。")
+                    if !silent {
+                        self.showingUpdateSheet = true
+                    }
+                case .upToDate(_, let latest):
+                    self.updateState = .upToDate(latest)
+                    if !silent {
+                        self.appendLog(level: .info, message: "当前 \(current.displayTag) 已是最新版本（最新发布 \(latest.displayTag)）。")
+                    }
+                case .noReleasesYet:
+                    self.updateState = .upToDate(current)
+                    if !silent {
+                        self.appendLog(level: .info, message: "仓库尚无正式发布的 Release（当前版本 \(current.displayTag)）。")
+                    }
+                }
+            } catch {
+                if Task.isCancelled { return }
+                let msg = error.localizedDescription
+                if silent {
+                    self.updateState = .idle
+                } else {
+                    self.updateState = .failed(msg)
+                    self.appendLog(level: .warning, message: "检查更新失败：\(msg)")
+                    self.isLogDrawerExpanded = true
+                }
+            }
+        }
+    }
+
+    public func performUpdate(_ release: ReleaseInfo) {
+        if case .downloading = updateState { return }
+        updateTask?.cancel()
+        updateState = .downloading(release, "正在初始化更新...")
+
+        updateTask = Task {
+            let updater = AppUpdater()
+            do {
+                let prepared = try await updater.downloadAndPrepareUpdate(release: release) { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        if case .downloading = self.updateState {
+                            self.updateState = .downloading(release, progress)
+                        }
+                    }
+                }
+                if Task.isCancelled { return }
+                self.updateState = .downloading(release, "验证通过，正在替换并重启...")
+                try updater.installAndRelaunch(prepared: prepared, targetAppURL: Bundle.main.bundleURL)
+                self.appendLog(level: .success, message: "正在重启并升级至 \(release.tagName)...")
+                NSApp.terminate(nil)
+            } catch {
+                if Task.isCancelled { return }
+                let msg = error.localizedDescription
+                self.updateState = .failed(msg)
+                self.appendLog(level: .error, message: "更新失败：\(msg)")
+                self.isLogDrawerExpanded = true
+            }
         }
     }
 

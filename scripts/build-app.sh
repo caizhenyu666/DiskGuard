@@ -4,7 +4,18 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-echo "==> Building release binary..."
+APP_VERSION="${DISKGUARD_VERSION:-}"
+if [[ -z "$APP_VERSION" && -f "$ROOT_DIR/VERSION" ]]; then
+  APP_VERSION="$(tr -d '[:space:]' < "$ROOT_DIR/VERSION")"
+fi
+APP_VERSION="${APP_VERSION:-1.1.0}"
+
+BUILD_NUMBER="${DISKGUARD_BUILD_NUMBER:-}"
+if [[ -z "$BUILD_NUMBER" ]]; then
+  BUILD_NUMBER="$(git -C "$ROOT_DIR" rev-list --count HEAD 2>/dev/null || echo 1)"
+fi
+
+echo "==> Building release binary (v${APP_VERSION}, build ${BUILD_NUMBER})..."
 swift build --disable-sandbox -c release
 
 BIN_PATH="$(swift build --disable-sandbox -c release --show-bin-path)/DiskGuard"
@@ -161,7 +172,7 @@ echo "==> Assembling DiskGuard.app..."
 cp "$BIN_PATH" "$MACOS_DIR/DiskGuard"
 chmod +x "$MACOS_DIR/DiskGuard"
 
-cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
+cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -183,9 +194,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>${BUILD_NUMBER}</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
@@ -196,6 +207,20 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-echo "==> Ad-hoc codesigning DiskGuard.app..."
-codesign --force --deep --sign - "$APP_BUNDLE"
-echo "==> Done: $APP_BUNDLE"
+PREFERRED_IDENTITY="${DISKGUARD_SIGN_IDENTITY:-DiskGuard Local Signing}"
+REQUIRE_FIXED_SIGNING="${REQUIRE_FIXED_SIGNING:-0}"
+if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$PREFERRED_IDENTITY"; then
+  echo "==> Signing DiskGuard.app with fixed identity: $PREFERRED_IDENTITY"
+  codesign --force --deep --sign "$PREFERRED_IDENTITY" "$APP_BUNDLE"
+elif [[ "$REQUIRE_FIXED_SIGNING" == "1" ]]; then
+  echo "Error: Fixed signing identity '$PREFERRED_IDENTITY' not found." >&2
+  echo "Run ./scripts/setup-signing-cert.sh first so Full Disk Access persists across updates." >&2
+  exit 1
+else
+  echo "==> Warning: Fixed signing identity '$PREFERRED_IDENTITY' not found; falling back to ad-hoc signing (-)."
+  echo "    Run ./scripts/setup-signing-cert.sh once so macOS Full Disk Access persists across updates."
+  codesign --force --deep --sign - "$APP_BUNDLE"
+fi
+
+echo "==> Done: $APP_BUNDLE (v${APP_VERSION}, build ${BUILD_NUMBER})"
+codesign -dv --requirements - "$APP_BUNDLE" 2>&1 || true
